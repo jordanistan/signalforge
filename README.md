@@ -24,28 +24,70 @@ SignalForge is receive-only for aircraft and SDR features. Mesh transmission hap
 
 The Air and Satellites map panels use SignalForge's bundled offline vector basemap. They do not depend on third-party map tiles, so a tile-provider policy response cannot blank those views.
 
-## Start in demo mode
+## Setup
 
-Demo mode needs no radio, SDR, internet feed, or saved node snapshot. It creates an isolated sample mesh state and labels outgoing messages as simulated.
+SignalForge is developed and verified on Linux with Python 3.14. Other Python 3 versions, macOS and Windows have not been tested (serial device names differ there: pass `-p PORT`).
+
+### 1. Get the code and try demo mode
+
+Demo mode needs no radio, SDR, internet feed, or saved node snapshot. It creates an isolated sample mesh state and labels outgoing messages as simulated, so it is the safest first run on a new machine.
 
 ```sh
+git clone <this-repository-url> signalforge
+cd signalforge
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python tools/meshweb.py --demo
 ```
 
-Open the private URL printed in the terminal. Demo files live under `run/demo/`, separate from live mesh history.
+Open the **full URL printed in the terminal** (it ends in `?token=...`). The bare address `http://127.0.0.1:8765/` answers `401` by design: the page can transmit on your radio, so it requires the token. The browser stores it as a cookie, and the token is also kept in `run/web-url.txt` (mode `0600`). Demo files live under `run/demo/`, separate from live mesh history.
 
-To connect a real radio:
+### 2. Connect a real radio
+
+1. Plug in a Meshtastic radio over USB. Many boards appear as `/dev/ttyUSB0` (Heltec V3) or `/dev/ttyACM0`; `ls /dev/ttyUSB* /dev/ttyACM*` shows yours.
+2. Give your user access to serial devices, then log out and back in. Arch-based systems use the `uucp` group, Debian and Ubuntu use `dialout`:
+   ```sh
+   sudo usermod -aG uucp "$USER"     # or: sudo usermod -aG dialout "$USER"
+   ```
+3. Install the optional Python packages and find your node ID (shown as `!` plus eight hex digits, for example `!abcd1234`):
+   ```sh
+   .venv/bin/python -m pip install -r requirements-optional.txt
+   .venv/bin/python -m meshtastic --port /dev/ttyUSB0 --info | head -40
+   ```
+4. Run it. `--home LAT,LON` is used when the radio has no GPS fix; without it SignalForge uses a clearly labelled assumed location (downtown Austin, TX), so set your own:
+   ```sh
+   .venv/bin/python tools/meshweb.py -p /dev/ttyUSB0 --home 40.7128,-74.0060
+   ```
+5. Run `make doctor` at any time for a read-only check of Python packages, external programs, the serial path, and Chromium. It never opens the radio or transmits.
+
+Only one program may hold the serial port. Stop the browser console before starting `tools/meshtui.py` or `tools/mesh-bridge.py`, and the reverse. Use `--http-port`, `--state-dir`, `--no-radio`, `--no-weather`, and `--no-sats` to adapt the process to your setup. The browser listens on loopback only; pass `--new-token` to rotate the token.
+
+### 3. Optional receive-only SDR tools
+
+The Air, Radio, Pagers, and Sensors pages need an RTL-SDR dongle and these programs. Package names vary by distribution; `make doctor` reports which are missing, and each missing one only disables its own feature.
 
 ```sh
-.venv/bin/python -m pip install -r requirements-optional.txt
-.venv/bin/python tools/meshweb.py --home 30.267,-97.743
+# Arch-based (typical package names)
+sudo pacman -S rtl-sdr ffmpeg multimon-ng rtl_433
+# Debian / Ubuntu (typical package names)
+sudo apt install rtl-sdr ffmpeg multimon-ng rtl-433
 ```
 
-`--home LAT,LON` is used when the radio has no GPS fix. Without it, SignalForge uses a clearly labelled assumed reference location. Use `--http-port`, `--state-dir`, `--no-radio`, `--no-weather`, and `--no-sats` to adapt the process to your setup.
+If the dongle is grabbed by a kernel TV driver, blacklist `dvb_usb_rtl28xxu` (many `rtl-sdr` packages already ship this). SDR features are receive-only; SignalForge never transmits with an SDR.
 
-The browser listens on loopback only and requires the token URL printed at startup. The token is stored with mode `0600` and reused across restarts; pass `--new-token` to rotate it.
+### 4. Run the tests
+
+```sh
+.venv/bin/python -m pip install -r requirements-dev.txt
+make verify        # syntax checks + full suite (needs Chromium at /usr/bin/chromium for the browser tests)
+make test-unit     # everything except the Chromium browser tests
+```
+
+Tests use fake radios and fake SDR processes. They do not transmit, flash firmware, or need any hardware.
+
+### Running on a laptop
+
+A laptop is a good home for this: plug in the radio, follow steps 1 and 2, and open the token URL. For a laptop with no radio, use `--demo`. To reach the console from another device, use an SSH tunnel to the loopback port rather than exposing it (remote authentication is out of scope, see Status).
 
 ## The interfaces
 
@@ -54,8 +96,8 @@ The browser listens on loopback only and requires the token URL printed at start
 `tools/meshweb.py` owns the serial radio and serves the SignalForge web app. The default view is the Command Center; navigation also exposes Nodes, Chats, Air, Radio, Weather, Pagers, Sensors, and Satellites.
 
 ```sh
-.venv/bin/python tools/meshweb.py --home 30.267,-97.743
-.venv/bin/python tools/meshweb.py --bridge --allow '!02ecdcdc'
+.venv/bin/python tools/meshweb.py --home LAT,LON
+.venv/bin/python tools/meshweb.py --bridge --allow '!abcd1234'
 ```
 
 The browser protects the radio with a token cookie, strict Host/Origin checks, a restrictive Content Security Policy, text-only rendering for mesh content, and a 20-message-per-minute browser send limit. Only the visible chat clears unread state.
@@ -65,7 +107,7 @@ The browser protects the radio with a token cookie, strict Host/Origin checks, a
 Use the Textual console when you are on SSH or prefer a keyboard-first workflow:
 
 ```sh
-.venv/bin/python tools/meshtui.py --home 30.267,-97.743
+.venv/bin/python tools/meshtui.py --home LAT,LON
 ```
 
 It includes Dashboard, Map, and Messages tabs. `F1` opens Dashboard, `F5` opens Messages, `F6` opens Map, `F4` changes theme, and `Ctrl+Q` exits. Click or press Enter on a node to open its direct-message thread.
@@ -75,7 +117,7 @@ It includes Dashboard, Map, and Messages tabs. `F1` opens Dashboard, `F5` opens 
 The bridge prints messages from explicitly allowed node IDs and consumes replies queued by `mesh-reply.sh`:
 
 ```sh
-.venv/bin/python tools/mesh-bridge.py --allow '!02ecdcdc'
+.venv/bin/python tools/mesh-bridge.py --allow '!abcd1234'
 MESH_OUTBOX=run/outbox tools/mesh-reply.sh 'Short update from the operator.'
 ```
 
@@ -136,7 +178,7 @@ make verify
 
 `make verify` runs Python, shell, and JavaScript syntax checks and the full test suite. Tests use fake radios, fake SDR processes, canned NWS responses, local browser fixtures, and temporary state directories. They do not transmit, contact live feeds, or flash firmware.
 
-The current suite has **403 collected tests**. The known non-failing warning comes from Skyfield assigning a NumPy array dtype in a way NumPy 2.5 now deprecates.
+The current suite has **404 tests**, all passing in a full `make verify` run on 2026-09-21 (about two minutes). The known non-failing warning comes from Skyfield assigning a NumPy array dtype in a way NumPy 2.5 now deprecates.
 
 ## State, privacy, and recovery
 
@@ -164,6 +206,20 @@ Automated tests prove the software paths, not the antenna or USB radio. Before r
 6. Confirm live audio, ADS-B reception, weather refresh, and current satellite elements with the intended antenna and network.
 
 Firmware upgrades remain a separate operation. See `tools/upgrade-heltec-v3.sh` and retain the configuration backup before flashing.
+
+## Contributing
+
+Contributions are welcome: bug reports, fixes, new decoders, better docs, and hardware notes from radios and dongles other than the author's.
+
+1. Fork the repository and create a branch.
+2. Set up as in [Setup](#setup); demo mode (`--demo`) and the test suite need no hardware.
+3. Keep changes small and covered by a test. Tests use fake radios, fake SDR processes, and canned feed data; a test must never transmit, flash firmware, or contact a live service.
+4. Run `make verify` (or `make test-unit` if you do not have Chromium) before opening a pull request.
+5. Never commit `run/`, `backups/`, `firmware/`, or `data/raw/`: they hold access tokens, message history, node positions, and radio configuration that can include private keys. `.gitignore` already excludes them; check `git status` before you commit.
+
+Radio safety rules apply to contributions: SDR features stay receive-only, mesh text from other nodes is untrusted input (render it as text, never as HTML, and never let it trigger actions), and anything that transmits must be an explicit operator action.
+
+`CLAUDE.md` describes the architecture and the bridge rules for AI coding assistants; `docs/HANDOFF.md` lists open items and known gotchas.
 
 ## Status
 
