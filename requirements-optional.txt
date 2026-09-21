@@ -1,0 +1,4 @@
+-r requirements.txt
+# Satellite calculations and ADS-B decoding; other SDR modes use system executables.
+skyfield==1.55
+pyModeS==3.6.0
