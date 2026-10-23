@@ -1,0 +1,38 @@
+# SignalForge as a systemd *user* service (no root). It runs the full console without --bridge: the bridge's
+# stdout events are meant for an interactive Claude session, not a journal.
+#
+# Install (adjust the paths if the project is not in ~/Work/Meshtastic, and set your --home):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/signalforge.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now signalforge      # start now and at login
+#   loginctl enable-linger "$USER"                 # optional: keep running while logged out
+# Use:
+#   cat ~/Work/Meshtastic/run/web-url.txt          # the private token URL to open
+#   journalctl --user -u signalforge -f            # logs
+#   systemctl --user stop signalforge              # REQUIRED before meshtui, mesh-bridge or a --bridge session:
+#                                                  # only one program can own the radio and the dongle
+[Unit]
+Description=SignalForge Meshtastic + RTL-SDR console (loopback only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Work/Meshtastic
+ExecStart=%h/Work/Meshtastic/.venv/bin/python -u tools/meshweb.py -p /dev/ttyUSB0 --http-port 8765 --home 30.267,-97.743
+# SIGTERM goes to the server only, so it can stop its SDR receivers and close the radio itself; anything still
+# alive after TimeoutStopSec (a stuck rtl_* child) is then killed by systemd, so the dongle is always released.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=20
+# Crashes (exit 1) restart. Exit 3 = port 8765 already in use (another copy running) and exit 2 = bad
+# arguments: restarting cannot fix those, so do not loop on them.
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=2 3
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

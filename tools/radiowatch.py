@@ -133,6 +133,15 @@ def friendly_error(stderr):
     return (stderr or "").strip().splitlines()[-1][:160] if (stderr or "").strip() else ""
 
 
+def orphan_guard(argv, have_setpriv=None):
+    """Prefix a receiver program so the kernel stops it if its parent dies (setpriv --pdeathsig, util-linux).
+    Normal stops kill the whole process group; this covers the server being killed outright (SIGKILL, crash),
+    which would otherwise leave rtl_433 / rtl_fm running and holding the dongle. The death signal survives exec,
+    and each program in a shell pipeline gets its own, so the chain unwinds as each parent exits."""
+    have_setpriv = shutil.which("setpriv") is not None if have_setpriv is None else have_setpriv
+    return ["setpriv", "--pdeathsig", "TERM", *argv] if have_setpriv else list(argv)
+
+
 async def run_command(cmd, timeout):
     """Run cmd, return (stdout, stderr). If we are cancelled (survey stopped, or a listen request pre-empts it) or
     time out, the whole process group is killed and reaped BEFORE returning, so the SDR dongle is free again."""
@@ -152,7 +161,7 @@ async def run_command(cmd, timeout):
 async def _run_survey(band, seconds):
     """Default survey runner: rtl_power for `seconds`; returns (csv_text, stderr_text)."""
     _name, lo, hi, step, _digital = band
-    return await run_command(rtl_power_cmd(lo, hi, step, seconds), seconds + 25)
+    return await run_command(orphan_guard(rtl_power_cmd(lo, hi, step, seconds)), seconds + 25)
 
 
 def _kill(proc, sig=15):
@@ -205,56 +214,67 @@ def serialized(method):
 
 
 ADSB_GAIN = 40.0  # dB. Measured on this dongle: automatic gain heard 1 valid aircraft message in 35 s, 40 dB heard 31
+# ADS-B receivers, best first. readsb and dump1090 demodulate far better than rtl_adsb (which has no error correction
+# and prints many noise frames); all three print the same `*<hex>;` raw lines with --raw, so the parser is shared.
+ADSB_PROGRAMS = ("readsb", "dump1090-fa", "dump1090", "rtl_adsb")
 
 
-def adsb_cmd(gain=ADSB_GAIN, have_stdbuf=None):
-    """rtl_adsb command line. stdbuf makes it line-buffered: through a pipe it would otherwise hold frames back in a
-    4 KB block and the map would sit empty. Fixed gain matters a lot for ADS-B."""
+def adsb_program(which=None):
+    """The best installed ADS-B receiver program, or None."""
+    which = which or shutil.which
+    return next((name for name in ADSB_PROGRAMS if which(name)), None)
+
+
+def adsb_cmd(gain=ADSB_GAIN, have_stdbuf=None, program="rtl_adsb"):
+    """ADS-B receiver command line printing raw frames on stdout. stdbuf makes it line-buffered: through a pipe it
+    would otherwise hold frames back in a 4 KB block and the map would sit empty. Fixed gain matters a lot for ADS-B."""
     have_stdbuf = shutil.which("stdbuf") is not None if have_stdbuf is None else have_stdbuf
-    cmd = ["rtl_adsb"] + (["-g", f"{gain:g}"] if gain else [])
+    if program in ("readsb", "dump1090-fa"):
+        cmd = [program, "--device-type", "rtlsdr", "--raw"] + (["--gain", f"{gain:g}"] if gain else [])
+    elif program == "dump1090":
+        cmd = [program, "--raw"] + (["--gain", f"{gain:g}"] if gain else [])
+    else:
+        cmd = ["rtl_adsb"] + (["-g", f"{gain:g}"] if gain else [])
     return (["stdbuf", "-oL"] + cmd) if have_stdbuf else cmd
 
 
 async def _spawn_adsb():
-    """Default ADS-B source: rtl_adsb prints one `*<hex>;` line per received frame."""
-    return await asyncio.create_subprocess_exec(*adsb_cmd(), stdout=asyncio.subprocess.PIPE,
+    """Default ADS-B source: the best installed receiver, printing one `*<hex>;` line per received frame."""
+    return await asyncio.create_subprocess_exec(*orphan_guard(adsb_cmd(program=adsb_program() or "rtl_adsb")),
+                                                stdout=asyncio.subprocess.PIPE,
                                                 stderr=asyncio.subprocess.PIPE, start_new_session=True)
 
 
 async def _spawn_audio(mhz, squelch):
     """Default audio source: rtl_fm piped through ffmpeg to MP3. Returns the process whose stdout is the stream."""
-    cmd = " ".join(_q(c) for c in rtl_fm_cmd(mhz, squelch)) + " | " + " ".join(_q(c) for c in FFMPEG_CMD)
-    return await asyncio.create_subprocess_exec("sh", "-c", cmd, stdout=asyncio.subprocess.PIPE,
+    cmd = decoders.shell_pipe(orphan_guard(rtl_fm_cmd(mhz, squelch)), orphan_guard(FFMPEG_CMD))
+    return await asyncio.create_subprocess_exec(*orphan_guard(["sh", "-c", cmd]), stdout=asyncio.subprocess.PIPE,
                                                 stderr=asyncio.subprocess.PIPE, start_new_session=True)
 
 
 async def _spawn_job(shell_cmd):
-    """Default decoder source: a shell pipeline (rtl_fm | multimon-ng, or rtl_433) whose stdout is the decoded text."""
-    return await asyncio.create_subprocess_exec("sh", "-c", shell_cmd, stdout=asyncio.subprocess.PIPE,
+    """Default decoder source: a shell pipeline (rtl_433) whose stdout is the decoded text."""
+    return await asyncio.create_subprocess_exec(*orphan_guard(["sh", "-c", shell_cmd]), stdout=asyncio.subprocess.PIPE,
                                                 stderr=asyncio.subprocess.PIPE, start_new_session=True, cwd=ROOT)
 
 
 def job_error(kind_cls):
     """Which decoder programs are missing (empty string if all are installed)."""
-    need = {"pager": ("rtl_fm", "multimon-ng"), "sensors": ("rtl_433",)}.get(kind_cls.kind, ())
+    need = {"sensors": ("rtl_433",)}.get(kind_cls.kind, ())
     missing = [t for t in need if not shutil.which(t)]
     return f"{', '.join(missing)} not installed." if missing else ""
-
-
-def _q(s):
-    import shlex
-    return shlex.quote(s)
 
 
 class RadioWatch:
     """Surveys bands in a loop while enabled and streams audio on request. Only one job uses the dongle at a time."""
 
     def __init__(self, broadcast, bands=BANDS, survey_seconds=15, pause=5, survey=_run_survey, spawn_audio=_spawn_audio,
-                 snapshot=SNAPSHOT, available=None, kill=None, settle=0.8, retries=3, reference=None,
+                 snapshot=None, available=None, kill=None, settle=0.8, retries=3, reference=None,
                  spawn_adsb=_spawn_adsb, spawn_job=_spawn_job, job_check=job_error):
         self.broadcast, self.bands = broadcast, list(bands)
         self.survey_seconds, self.pause = survey_seconds, pause
-        self._survey, self._spawn_audio, self.snapshot = survey, spawn_audio, snapshot
+        self._survey, self._spawn_audio = survey, spawn_audio
+        self.snapshot = snapshot or SNAPSHOT  # resolved now so tests (and --state-dir) can redirect it
         self._kill = kill or _kill  # injectable so tests need no real process
         self.settle, self.retries = settle, retries  # USB needs a moment to release the dongle between jobs
         self.reference = tuple(reference) if reference else DEFAULT_REFERENCE
@@ -264,7 +284,7 @@ class RadioWatch:
         self._available_override = available
         self._control_lock = asyncio.Lock()
         self._control_owner = None
-        self.job = None  # a decoders.*Job (pager / sensors) while running or after it stopped (its results stay visible)
+        self.job = None  # a decoders.SensorJob while running or after it stopped (its results stay visible)
         self.job_enabled = False
         self.job_mhz = None
         self.job_error = None
@@ -274,6 +294,7 @@ class RadioWatch:
         self.table = None
         self._air_task = None
         self._air_proc = None
+        self._adsb_source = None  # name of the receiver program in use, for the UI
         self.enabled = False
         self.channels = {}  # band name -> [channel dicts]
         self.updated = None
@@ -297,15 +318,17 @@ class RadioWatch:
             return self._job_check(decoders.JOBS[mode])
         if self._available_override is True:
             return ""
-        required = {"survey": ("rtl_power",), "audio": ("rtl_fm", "ffmpeg"), "aircraft": ("rtl_adsb",)}
+        required = {"survey": ("rtl_power",), "audio": ("rtl_fm", "ffmpeg"), "aircraft": ()}
         missing = [name for name in required[mode] if not shutil.which(name)]
+        if mode == "aircraft" and adsb_program() is None:
+            missing.append("rtl_adsb (or readsb/dump1090)")
         if mode == "aircraft" and (adsb.pms is None or not callable(getattr(adsb.pms, "decode", None))):
             missing.append("compatible pyModeS")
         return f"{', '.join(missing)} not installed." if missing else ""
 
     def capabilities(self):
         return {mode: {"available": not error, "error": error or None}
-                for mode in ("survey", "audio", "aircraft", "pager", "sensors")
+                for mode in ("survey", "audio", "aircraft", "sensors")
                 for error in (self.capability_error(mode),)}
 
     @property
@@ -328,10 +351,12 @@ class RadioWatch:
 
     async def _publish(self):
         v = self.view()
-        try:
-            os.makedirs(os.path.dirname(self.snapshot), exist_ok=True)
-            with open(self.snapshot, "w", encoding="utf-8") as f:
+        try:  # atomic: a reader never sees half a file
+            os.makedirs(os.path.dirname(self.snapshot), mode=0o700, exist_ok=True)
+            tmp = self.snapshot + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(v, f)
+            os.replace(tmp, self.snapshot)
         except OSError:
             pass
         await self.broadcast({"type": "radio", "radio": v})
@@ -404,7 +429,8 @@ class RadioWatch:
         return {"enabled": self.aircraft_enabled, "reference": list(self.reference),
                 "reference_assumed": self.reference_assumed,
                 "aircraft": self.table.snapshot() if self.table else [],
-                "stats": {"frames": self.table.frames, "accepted": self.table.accepted} if self.table else None}
+                "receiver": self._adsb_source,
+                "stats": self.table.stats() if self.table else None}
 
     @serialized
     async def start_aircraft(self):
@@ -419,6 +445,7 @@ class RadioWatch:
         await self.close_audio()
         await self.stop_job()
         self.table = AircraftTable(self.reference)
+        self._adsb_source = adsb_program() if self._spawn_adsb is _spawn_adsb else None
         self.aircraft_enabled, self.error = True, None
         self._air_task = asyncio.create_task(self._aircraft_loop())
         await self._publish()
@@ -482,7 +509,7 @@ class RadioWatch:
             await self.broadcast({"type": "aircraft", **self.aircraft_view()})
 
 
-    # ---- decoder jobs (pagers, 433 MHz sensors) ---------------------------------------------------------
+    # ---- decoder job (ISM-band sensors) ---------------------------------------------------------
     def job_view(self):
         base = {"enabled": self.job_enabled, "kind": self.job.kind if self.job else None, "mhz": self.job_mhz,
                 "error": self.job_error, "presets": {k: v for k, v in decoders.PRESETS.items()}}
@@ -496,9 +523,11 @@ class RadioWatch:
         cls = decoders.JOBS.get(kind)
         if cls is None:
             raise ValueError("unknown decoder")
-        mhz = valid_mhz(mhz if mhz is not None else cls.default_mhz)
-        if mhz is None:
-            raise ValueError("frequency out of range")
+        mhz = mhz if mhz is not None else cls.default_mhz
+        if mhz != decoders.AUTO:
+            mhz = valid_mhz(mhz)
+            if mhz is None:
+                raise ValueError("frequency out of range")
         missing = self.capability_error(kind)
         if missing:
             self.job_error = missing
@@ -510,7 +539,8 @@ class RadioWatch:
         await self.stop_job(keep=False)
         self.job, self.job_mhz, self.job_error = cls(), mhz, None
         self.job_enabled = True
-        self._job_task = asyncio.create_task(self._job_loop(self.job.command(mhz)))
+        wrap = orphan_guard if self._spawn_job is _spawn_job else None
+        self._job_task = asyncio.create_task(self._job_loop(self.job.command(mhz, wrap=wrap)))
         await self._publish()
         await self._push_job()
 

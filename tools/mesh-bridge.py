@@ -8,6 +8,7 @@ This prints allowed messages and follow events; it does not run a research worke
 import argparse
 import asyncio
 import os
+import signal
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -16,18 +17,21 @@ if __name__ == "__main__" and sys.prefix == sys.base_prefix and os.path.exists(V
     os.execv(VENV_PYTHON, [VENV_PYTHON, *sys.argv])
 
 from meshcore import SerialBackend
-from meshweb import Hub
+from meshweb import Hub, prepare_state_dir
 from brand import PRODUCT_NAME
 
 
 async def run(args):
     state = os.path.abspath(os.path.expanduser(args.state_dir))
-    hub = Hub(lambda on_packet: SerialBackend(args.port, on_packet), allow=args.allow, bridge=True,
+    prepare_state_dir(state)
+    hub = Hub(lambda on_packet: SerialBackend(args.port, on_packet), allow=args.allow, bridge=True, port=args.port,
               log_path=os.path.join(state, "messages.jsonl"), nodes_json=os.path.join(state, "nodes.json"),
               follows_path=os.path.join(state, "follows.json"), outbox=os.path.join(state, "outbox"))
+    stop = asyncio.Event()
+    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stop.set)  # systemd/kill: close the radio cleanly
     try:
         await hub.start()
-        await asyncio.Event().wait()
+        await stop.wait()
     finally:
         await hub.stop()
 

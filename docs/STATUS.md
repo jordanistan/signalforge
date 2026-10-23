@@ -5,7 +5,7 @@ Last updated: 2026-09-21. This is the implementation handoff for the current bui
 ## Repository assessment
 
 The workspace already implements mesh messaging, a Textual terminal UI, a browser command center,
-offline maps, SDR surveying/audio, ADS-B, pager/environment sensor decoding, NWS weather,
+offline maps, SDR surveying/audio, ADS-B, environment sensor decoding (auto-scan; pager decoding removed), NWS weather,
 satellite tracking, and follow-topic bookkeeping. There is no separate product specification.
 The current milestone completes reliability, setup, capability reporting, and verification of those workflows.
 
@@ -48,6 +48,14 @@ The original browser fixture wrote its generated survey summary to `run/radio-ac
 initial run. The fixture now writes to a temporary directory. The prior transient survey summary was not
 captured and could not be restored; mesh messages, node snapshots, configuration backups, and firmware
 were not intentionally modified by verification.
+
+## Documentation update (2026-09-30)
+
+README rewritten as the front door; new `docs/USER-GUIDE.md` (use cases, page tour, bridge/follow,
+troubleshooting, security model) and `docs/HARDWARE.md` (devices, signal table, antennas). Documents
+concurrent work: `--debug-ui`, hashed asset URLs with `Cache-Control: no-cache`, Esri satellite map layers,
+radar rings on the Nodes/Air/Satellites maps, and readsb/dump1090 preference for ADS-B. The test counts
+above were not re-run for this update.
 
 ## Operational boundaries
 

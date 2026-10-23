@@ -112,27 +112,20 @@ const airPage = {
   enter() {
     if (!airPage.map) {
       const h = S.air.reference || myPos() || [39, -98];
-      const m = airPage.map = makeMap(airPage.mapEl, { center: h, zoom: 8, offline: true });
+      const m = airPage.map = L.map(airPage.mapEl, { zoomControl: true, doubleClickZoom: false, worldCopyJump: true }).setView(h, 8);
+      const { bases, labels } = addRadarBases(m, 'mesh.air.base', { offline: true });
       airPage.layer = L.layerGroup().addTo(m);
       airPage.trailLayer = L.layerGroup().addTo(m);
-      airPage.rings = L.layerGroup().addTo(m);
+      airPage.radar = makeRadar();
+      airPage.sweep = airPage.radar.sweep;
+      const radar = airPage.radar.group.addTo(m);
+      L.control.layers(bases, { 'Place labels': labels, 'Radar & rings': radar, Aircraft: airPage.layer, Trails: airPage.trailLayer }, { collapsed: true }).addTo(m);
+      new ResizeObserver(() => { m.invalidateSize(); airPage.sweep._update(); }).observe(airPage.mapEl);
       airPage.home = null;
     }
     setTimeout(() => { airPage.map.invalidateSize(); airPage.drawRings(); }, 60);
   },
-  drawRings() {
-    const ref = S.air.reference;
-    if (!airPage.map || !ref) return;
-    const key = ref.join(',');
-    if (airPage.ringKey === key) return;
-    airPage.ringKey = key;
-    airPage.rings.clearLayers();
-    for (const nm of [25, 50, 100, 150]) {
-      L.circle(ref, { radius: nm * 1852, fill: false, color: '#8b98a5', weight: 1, dashArray: '4 6', opacity: .6, interactive: false }).addTo(airPage.rings);
-      L.marker([ref[0] + (nm * 1852) / 111320, ref[1]], { interactive: false, icon: L.divIcon({ className: 'city', html: el('span', { text: `${nm} NM` }), iconSize: [0, 0] }) }).addTo(airPage.rings);
-    }
-    L.circleMarker(ref, { radius: 6, className: 'home-marker', interactive: false }).addTo(airPage.rings);
-  },
+  drawRings() { if (airPage.radar) syncAirRadar(airPage.radar); },
   fit() {
     const pts = S.air.aircraft.filter(a => a.lat != null).map(a => [a.lat, a.lon]);
     if (S.air.reference) pts.push(S.air.reference);
@@ -146,11 +139,12 @@ const airPage = {
     const btn = $('#ap-toggle');
     const cap = sdrCapability('aircraft');
     btn.disabled = !S.connected || (!A.enabled && !cap.available);
-    btn.title = cap.available ? '' : cap.error;
+    btn.title = cap.available ? (A.enabled ? '' : sdrTakeoverHint('aircraft')) : cap.error;
     btn.textContent = A.enabled ? '■ Stop tracking' : '▶ Start tracking';
     btn.classList.toggle('danger', A.enabled); btn.classList.toggle('primary', !A.enabled);
     const n = A.aircraft.length, withPos = A.aircraft.filter(a => a.lat != null).length;
-    $('#ap-status').textContent = !S.connected ? 'server disconnected' : A.enabled ? `${n} aircraft · ${withPos} on the map` : cap.available ? 'idle' : cap.error;
+    const rx = A.receiver ? ` · via ${A.receiver}` : ''; // which decoder program (rtl_adsb / readsb / dump1090)
+    $('#ap-status').textContent = !S.connected ? 'server disconnected' : A.enabled ? `${n} aircraft · ${withPos} on the map${rx}` : cap.available ? `idle${rx}` : cap.error;
     const err = $('#ap-err');
     err.replaceChildren(...(r && r.error && !A.enabled ? [el('div', { class: 'err-note', role: 'alert', text: r.error })] : []));
     airPage.drawRings();
@@ -175,7 +169,10 @@ const airPage = {
       k(String(n), 'aircraft now'), k(closest ? `${acName(closest)} · ${closest.dist_nm} NM` : '–', 'closest'),
       k(high ? `${acName(high)} · ${fmtAlt(high.alt_ft)}` : '–', 'highest'), k(fast ? `${acName(fast)} · ${fast.gs_kt} kt` : '–', 'fastest'),
       k(far ? `${far.dist_nm} NM ${far.bearing}°` : '–', 'farthest'), k(A.stats ? `${A.stats.accepted}/${A.stats.frames}` : '–', 'valid frames'),
-    ), el('div', { class: 'dim', style: 'margin-top:8px;font-size:12px', text: A.reference ? `Distances from ${A.reference_assumed ? 'downtown Austin (assumed: start the server with --home LAT,LON)' : 'your position'} · ${A.reference[0].toFixed(3)}, ${A.reference[1].toFixed(3)}` : '' }));
+    ), ...((A.stats?.frames ?? 0) > 50 && A.stats?.accepted === 0
+      ? [el('div', { class: 'noise-hint', id: 'ap-noise', role: 'status', text: 'Hearing only noise so far — no valid aircraft messages. Put the antenna near a window or outside; 1090 MHz needs a short antenna (about 6.9 cm per element).' })]
+      : []),
+    el('div', { class: 'dim', style: 'margin-top:8px;font-size:12px', text: A.reference ? `Distances from ${A.reference_assumed ? 'downtown Austin (assumed: start the server with --home LAT,LON)' : 'your position'} · ${A.reference[0].toFixed(3)}, ${A.reference[1].toFixed(3)}` : '' }));
     // detail
     const d = $('#ap-detail');
     d.replaceChildren();

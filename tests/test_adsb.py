@@ -238,3 +238,97 @@ def test_invalid_decoded_positions_are_rejected(monkeypatch, position):
     tracker.feed(POS_EVEN)
     tracker.feed(POS_ODD)
     assert tracker.snapshot()[0]["lat"] is None
+
+
+# ---- real receiver output, checksums and frame statistics --------------------------------------
+# Published ADS-B frames ("The 1090 MHz Riddle", Junzi Sun) with valid CRC-24 parity, written exactly the way
+# rtl_adsb prints them: lower-case hex between '*' and ';', CRLF line endings.
+REAL_FRAMES = [IDENT, POS_EVEN, POS_ODD, VELOCITY,
+               "8DA05F219B06B6AF189400CBC33F",  # airspeed velocity, 375 kt
+               "8D406B902015A678D4D220AA4BDA"]  # identification EZY85MH
+
+
+def rtl_adsb_line(frame):
+    return ("*" + frame.lower() + ";\r\n")
+
+
+def flip(frame, bit):
+    return f"{int(frame, 16) ^ (1 << (111 - bit)):028X}"
+
+
+@pytest.mark.parametrize("frame", REAL_FRAMES)
+def test_real_frames_have_zero_crc_remainder(frame):
+    assert adsb.crc_remainder(frame) == 0
+
+
+def test_rtl_adsb_formatted_lines_are_all_accepted():
+    t = table(max_range_nm=10_000)
+    assert all(t.feed(rtl_adsb_line(f)) for f in REAL_FRAMES)
+    s = t.stats()
+    assert s["frames"] == s["accepted"] == len(REAL_FRAMES) and s["rejected"] == 0
+    assert {a["icao"] for a in t.snapshot()} == {"4840D6", "40621D", "485020", "A05F21", "406B90"}
+    assert {a["callsign"] for a in t.snapshot()} >= {"KLM1023", "EZY85MH"}
+
+
+@pytest.mark.parametrize("bit", [5, 40, 87, 111])
+def test_a_single_wrong_bit_is_repaired_for_a_known_aircraft(bit):
+    t = table()
+    assert t.feed(rtl_adsb_line(IDENT)) is True  # heard intact first
+    assert t.feed(rtl_adsb_line(flip(IDENT, bit))) is True
+    assert t.snapshot()[0]["callsign"] == "KLM1023" and t.snapshot()[0]["msgs"] == 2
+    assert t.stats()["corrected"] == 1 and t.stats()["accepted"] == 2
+
+
+def test_a_repairable_frame_from_an_unknown_aircraft_is_rejected():
+    t = table()
+    assert t.feed(rtl_adsb_line(flip(IDENT, 40))) is False
+    assert t.snapshot() == [] and t.stats()["corrected"] == 0 and t.stats()["crc_failed"] == 1
+
+
+def test_a_repair_needs_a_recent_clean_frame():
+    clock = Clock()
+    t = table(clock=clock, ttl=60)
+    t.feed(IDENT)
+    clock.t += 61
+    assert t.feed(flip(IDENT, 40)) is False
+
+
+def test_rtl_adsb_frame_missing_its_last_bit_is_repaired():
+    # rtl_adsb prints a frame whose final Manchester bit failed as if that bit were 0.
+    damaged = f"{int(POS_ODD, 16) & ~1:028X}"
+    assert damaged != POS_ODD
+    t = table()
+    t.feed(POS_EVEN)  # same aircraft, intact
+    assert t.feed(rtl_adsb_line(damaged)) and t.stats()["corrected"] == 1
+    assert t.snapshot()[0]["alt_ft"] == 38000
+
+
+def test_two_wrong_bits_and_downlink_format_errors_are_not_repaired():
+    t = table()
+    assert t.feed(flip(flip(IDENT, 30), 60)) is False  # two errors: dropped, never guessed
+    assert t.feed(flip(IDENT, 2)) is False  # DF bits are never changed: now it is not an ADS-B frame
+    s = t.stats()
+    assert s["accepted"] == 0 and s["crc_failed"] == 1 and s["other_df"] == 1 and t.snapshot() == []
+
+
+def test_frame_statistics_explain_every_rejection():
+    t = table()
+    for line in ["", "*8D40;", "*5d4840d62f5a2b;\r\n", "*a0001838ca3e51f0a8000047a36a;\r\n", rtl_adsb_line(IDENT)]:
+        t.feed(line)
+    s = t.stats()
+    assert s == {"frames": 5, "accepted": 1, "rejected": 4, "corrected": 0, "crc_failed": 0, "other_df": 1,
+                 "short": 1, "malformed": 2}
+    assert s["rejected"] == s["malformed"] + s["short"] + s["other_df"] + s["crc_failed"]
+
+
+def test_receiver_noise_is_counted_but_never_accepted():
+    """What an RTL-SDR hearing no aircraft prints: long frames of random bits. About 1 in 8 look like ADS-B by their
+    first five bits and all of those fail the checksum; the rest are other downlink formats."""
+    import random
+    rng = random.Random(1090)
+    t = table()
+    for _ in range(4000):
+        t.feed("*%028x;\r\n" % (rng.getrandbits(111) | 1 << 111))
+    s = t.stats()
+    assert s["accepted"] == 0 and t.snapshot() == []
+    assert s["crc_failed"] + s["other_df"] == 4000 and 350 < s["crc_failed"] < 650

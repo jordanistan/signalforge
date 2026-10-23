@@ -35,6 +35,20 @@ function skyPlot(sats) {
   return svg;
 }
 
+function skyRadar() {
+  const me = myPos(), key = me ? me.join() : '';
+  if (!SK.radar || SK.radarKey === key) return;
+  SK.radarKey = key;
+  clearRings(SK.radar);
+  if (!me) { SK.radar.sweep.set(null, 0); return; }
+  for (const km of [750, 1500, 2250]) {
+    L.circle(me, { radius: km * 1000, interactive: false, className: 'nm-ring', fill: false }).addTo(SK.radar.rings);
+    ringLabel(SK.radar, me, km, km === 2250 ? `${kmMi(km)} · ISS above horizon` : kmMi(km));
+  }
+  L.circleMarker(me, { radius: 6, className: 'home-marker', interactive: false }).addTo(SK.radar.rings);
+  SK.radar.sweep.set(me, 2250);
+  SK.map.fitBounds(L.latLng(me).toBounds(2250 * 2000), { padding: [10, 10] }); // your sky, not the whole world
+}
 const skyPage = {
   build(sec) {
     const sh = pageShell('Satellites', el('span', { id: 'sk-loc', class: 'dim' }), el('span', { class: 'grow' }), el('span', { id: 'sk-age', class: 'dim' }),
@@ -53,23 +67,34 @@ const skyPage = {
   },
   enter() {
     if (!SK.map) {
-      SK.map = makeMap(skyPage.mapEl, { center: [20, 0], zoom: 2, offline: true });
+      // Same bases as the other maps: satellite imagery covers the whole world, so ground tracks over the
+      // oceans keep their context (the offline vector map only covers the continental US).
+      SK.map = L.map(skyPage.mapEl, { zoomControl: true, doubleClickZoom: false, worldCopyJump: true }).setView([20, 0], 2);
+      const { bases, labels } = addRadarBases(SK.map, 'mesh.sky.base', { offline: true });
       SK.tracks = L.layerGroup().addTo(SK.map);
       SK.sats = L.layerGroup().addTo(SK.map);
+      // radar around you: 2,250 km is roughly how far away the ISS (about 420 km up) can be and still clear the horizon
+      SK.radar = makeRadar();
+      SK.radar.group.addTo(SK.map);
+      L.control.layers(bases, { 'Place labels': labels, 'Radar & rings': SK.radar.group, 'Ground tracks': SK.tracks, Satellites: SK.sats }, { collapsed: true }).addTo(SK.map);
+      new ResizeObserver(() => { SK.map.invalidateSize(); SK.radar.sweep._update(); }).observe(skyPage.mapEl);
     }
-    setTimeout(() => SK.map.invalidateSize(), 60);
+    setTimeout(() => { SK.map.invalidateSize(); skyRadar(); }, 60);
     skyRequest();
     clearInterval(SK.timer);
     SK.timer = setInterval(skyRequest, 5000);
   },
   leave() { clearInterval(SK.timer); SK.timer = 0; },
   render() {
+    skyRadar(); // no-op unless your position changed (it can arrive after the page opened)
     const D = S.sats;
     const unavailable = serviceAvailable('sats') === false;
     $('#sk-refresh').disabled = !S.connected || unavailable;
     if (!D || unavailable) {
       const msg = unavailable ? S.capabilityErrors.sats || 'Satellite tracking is not enabled on this server.' : !S.connected ? 'Waiting for the server connection…' : 'Loading orbital data… (needs the internet the first time)';
       $('#sk-list').replaceChildren(el('div', { class: 'empty-state', text: msg }));
+      $('#sk-plot').replaceChildren(el('div', { class: 'empty-state', text: unavailable ? 'No sky plot without orbital data.' : 'Waiting for orbital data…' }));
+      $('#sk-pbody').replaceChildren(el('tr', {}, el('td', { class: 'empty', text: unavailable ? 'No pass predictions without orbital data.' : 'Waiting for orbital data…' })));
       return;
     }
     $('#sk-err').replaceChildren(...(D.error ? [el('div', { class: 'err-note', role: 'alert', text: D.error })] : []));

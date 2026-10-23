@@ -43,6 +43,32 @@ def jump_ok(prev, new, dt, max_kt=1200.0):
     return distance_nm(prev, new) / (dt / 3600.0) <= max_kt
 
 
+CRC_POLY = 0x1FFF409  # Mode S CRC-24 generator polynomial
+
+
+def crc_remainder(msg):
+    """Mode S CRC-24 remainder of a hex frame (parity bits included). 0 means an ADS-B (DF17/18) frame is intact."""
+    bits = len(msg) * 4
+    n = int(msg, 16)
+    for i in range(bits - 1, 23, -1):
+        if n >> i & 1:
+            n ^= CRC_POLY << (i - 24)
+    return n & 0xFFFFFF
+
+
+# Syndrome of a single flipped bit in a 112-bit frame -> that bit's position. Bits 0-4 are the downlink format and
+# are never "repaired": changing them would turn some other kind of frame into a plausible-looking ADS-B one.
+_SINGLE_BIT = {crc_remainder(f"{1 << (111 - i):028X}"): i for i in range(5, 112)}
+
+
+def repair_single_bit(msg):
+    """A 28-hex-digit frame with exactly one wrong bit, corrected (the same repair dump1090 does), or None."""
+    bit = _SINGLE_BIT.get(crc_remainder(msg)) if len(msg) == 28 else None
+    if bit is None:
+        return None
+    return f"{int(msg, 16) ^ (1 << (111 - bit)):028X}"
+
+
 def clean_frame(raw):
     """'*8D4840D6...;' or '8d4840d6...' -> upper-case hex, or None if it cannot be a Mode S frame."""
     s = (raw or "").strip().lstrip("*").rstrip(";").upper()
@@ -61,6 +87,12 @@ class AircraftTable:
         self.reference, self.ttl, self.max_range_nm, self.clock = tuple(reference), ttl, max_range_nm, clock
         self.aircraft = {}
         self.frames = self.accepted = self.rejected = 0
+        # Why frames were not used, so a receiver hearing only noise can be told apart from a decoding problem:
+        # malformed = not a hex Mode S frame; short = 56-bit replies (no ADS-B content); other_df = long frames that
+        # are not ADS-B (Comm-B replies, or noise whose first bits are random); crc_failed = ADS-B frames damaged
+        # beyond a one-bit repair (or repairable but from an aircraft not heard intact recently);
+        # corrected = ADS-B frames accepted after a one-bit repair.
+        self.malformed = self.short = self.other_df = self.crc_failed = self.corrected = 0
 
     def feed(self, raw, now=None):
         """Decode one frame and merge it into the table. Returns True if it was a valid ADS-B message."""
@@ -68,21 +100,47 @@ class AircraftTable:
         msg = clean_frame(raw)
         self.frames += 1
         if msg is None:
+            self.malformed += 1
             self.rejected += 1
             return False
+        if len(msg) == 14:
+            self.short += 1
+            self.rejected += 1
+            return False
+        if int(msg[:2], 16) >> 3 not in (17, 18):
+            self.other_df += 1
+            self.rejected += 1
+            return False
+        repaired = False
+        if crc_remainder(msg):
+            fixed = repair_single_bit(msg)
+            # A repair is trusted only for an aircraft already heard intact recently: across hours of noise a
+            # random frame will occasionally look one bit away from valid, and must not invent an aircraft.
+            known = self.aircraft.get(fixed[2:8]) if fixed else None
+            if fixed is None or not known or now - known["_clean"] > self.ttl:
+                self.crc_failed += 1
+                self.rejected += 1
+                return False
+            msg, repaired = fixed, True
         try:
             d = pms.decode(msg)  # no reference: raw CPR fields are combined below, never against the receiver
         except Exception:  # bad length/hex/unknown format from a noisy frame
+            self.crc_failed += 1
             self.rejected += 1
             return False
         # Only self-identified ADS-B (DF17/18) with a good checksum: everything else may be a corrupted frame.
         if d.get("df") not in (17, 18) or not d.get("crc_valid") or not d.get("icao"):
+            self.crc_failed += 1
             self.rejected += 1
             return False
         self.accepted += 1
+        self.corrected += repaired
         ac = self.aircraft.setdefault(d["icao"], {"icao": d["icao"], "callsign": None, "alt_ft": None, "gs_kt": None,
                                                     "track": None, "vrate": None, "lat": None, "lon": None,
-                                                    "pos_time": None, "first_seen": now, "msgs": 0, "_cpr": {}})
+                                                    "pos_time": None, "first_seen": now, "msgs": 0, "_cpr": {},
+                                                    "_clean": now})
+        if not repaired:
+            ac["_clean"] = now
         ac["last_seen"], ac["msgs"] = now, ac["msgs"] + 1
         cs = (d.get("callsign") or "").strip().strip("_")
         if cs:
@@ -100,6 +158,12 @@ class AircraftTable:
         if d.get("typecode") in (*range(9, 19), *range(20, 23)) and d.get("cpr_format") in (0, 1) and d.get("cpr_lat") is not None and d.get("cpr_lon") is not None:
             self._update_position(ac, d["cpr_format"], d["cpr_lat"], d["cpr_lon"], now)
         return True
+
+    def stats(self):
+        """Frame counters for the UI: frames = everything the receiver printed; the rest say where they went."""
+        return {"frames": self.frames, "accepted": self.accepted, "rejected": self.rejected,
+                "corrected": self.corrected, "crc_failed": self.crc_failed, "other_df": self.other_df,
+                "short": self.short, "malformed": self.malformed}
 
     def _update_position(self, ac, fmt, lat_raw, lon_raw, now):
         cpr = ac["_cpr"]

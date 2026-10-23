@@ -147,6 +147,26 @@ def resolve_port(port, exists=os.path.exists, find=None):
     raise OSError(f"{port or 'no port given'} is not present and {len(found)} candidate radios were found")
 
 
+def radio_error_hint(exc, port=None):
+    """One actionable sentence for a failed radio connection, for people who have not met pyserial's wording."""
+    text = str(exc) or type(exc).__name__
+    low = text.lower()
+    where = port or "the serial port"
+    if "exclusively lock" in low or "resource temporarily unavailable" in low or "busy" in low:
+        hint = (f"Another program is using {where} (a second SignalForge, meshtui, mesh-bridge or the meshtastic CLI). "
+                f"Close it; `fuser -v {where}` shows which. Retrying automatically.")
+    elif "permission denied" in low:
+        hint = (f"No permission to open {where}. Add yourself to the serial group (Arch: `sudo usermod -aG uucp $USER`), "
+                "then log out and back in.")
+    elif "candidate radios were found" in low or "no such file" in low or "could not open port" in low:
+        hint = "No radio found. Plug it in (use a data USB cable); SignalForge keeps retrying."
+    elif "timed out" in low or "timeout" in low:
+        hint = "The radio did not answer. Unplug it for a few seconds and plug it back in; SignalForge keeps retrying."
+    else:
+        return f"Could not open radio: {text}"
+    return f"Could not open radio: {hint} ({text[:120]})"
+
+
 class SerialBackend:
     """Thin wrapper over meshtastic's SerialInterface; on_text(packet) runs on the library's thread.
     Set `on_lost` to be called (on a library thread) when the link to the radio drops."""

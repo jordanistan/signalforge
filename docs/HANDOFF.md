@@ -69,7 +69,7 @@ These need a decision from the repository owner. None were changed in the last s
    missing (`tests/test_web_e2e.py`). `gh` on the author's machine lacks the `workflow` scope, so adding a GitHub
    Actions workflow needs `gh auth refresh -s workflow` first.
 6. **Untested on hardware in this session:** SDR modes, the firmware script, and radio acknowledgements. Automated
-   tests use fakes. See "Hardware acceptance" in `README.md`.
+   tests use fakes. See "Hardware acceptance still required" in `docs/OPERATIONS.md`.
 
 ## Suggested next steps
 
@@ -90,5 +90,4 @@ git push -u origin main
 Do the open items above first, in particular the LICENSE. The history so far is two or three commits, so rewriting it is
 still cheap if you decide to remove the author's node IDs before the first push. Once pushed, treat anything in it as public.
 
-Test result at wrap-up: `make verify` passed on 2026-09-21 with 404 tests in about two minutes (Codex's docs say 403; the
-README now says 404). No hardware was used.
+Test result at wrap-up: `make verify` passed on 2026-09-21 with 404 tests in about two minutes (Codex's docs say 403). No hardware was used.

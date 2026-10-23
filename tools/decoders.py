@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Line-oriented SDR decoders for the web GUI: pagers (POCSAG/FLEX via multimon-ng) and 433 MHz sensors (rtl_433).
+"""Line-oriented SDR decoder for the web GUI: ISM-band environment sensors (rtl_433).
 
 Receive-only, like everything else here. Each decoder is a `Job`: it builds the shell pipeline that owns the dongle,
 turns one output line at a time into events, and reports a JSON-able `view()`. RadioWatch (radiowatch.py) runs one
 job at a time because the dongle is exclusive.
 
 Privacy rules built in, because these signals are broadcast by other people's equipment:
-  * Pager text is kept in memory only (a short ring buffer), never written to disk and never relayed anywhere.
-    Pagers used by hospitals and clinics can carry personal details; treat what you see accordingly.
+  * There is deliberately no pager decoder: in the US, reading other people's display-pager messages is generally
+    prohibited (ECPA), and they often carry medical details. The band survey only reports whether a paging
+    channel is busy, never message content.
   * Vehicle tyre-pressure (TPMS) sensors carry a fixed ID per car, which makes them a way to follow a vehicle, and
     door/alarm/remote sensors reveal what a household is doing. Only environment sensors (temperature, humidity,
     wind, rain, pressure...) are listed; everything else is counted as "ignored" and its content is dropped.
@@ -19,21 +20,11 @@ import shlex
 import time
 from collections import deque
 
-# ---- pagers ---------------------------------------------------------------------------------------------
-PAGER_PRESETS = [  # (MHz, label): common US paging channels
-    (929.6125, "929.6125 · US paging (929 MHz band)"),
-    (931.0625, "931.0625 · US paging (931 MHz band)"),
-    (929.9375, "929.9375 · US paging"),
-    (152.48, "152.480 · VHF paging"),
-    (157.45, "157.450 · VHF paging"),
-    (158.10, "158.100 · VHF paging"),
-]
-SENSOR_PRESETS = [(433.92, "433.92 · ISM (most sensors)"), (315.0, "315.0 · ISM (US remotes/sensors)"),
+AUTO = "auto"  # hop across the US/most-common ISM bands so nothing near you is missed
+AUTO_FREQS, AUTO_HOP_S = (433.92, 315.0, 915.0), 60
+SENSOR_PRESETS = [(AUTO, "Auto · 433.92 / 315 / 915, switching every 60 s"), (433.92, "433.92 · ISM (most sensors)"), (315.0, "315.0 · ISM (US remotes/sensors)"),
                   (868.3, "868.3 · ISM (Europe)"), (915.0, "915.0 · ISM (US)")]
 
-_POCSAG = re.compile(r"^(POCSAG\d+):\s*Address:\s*(\d+)\s+Function:\s*(\d)(?:\s+(Alpha|Numeric):\s?(.*))?$")
-_FLEX_PIPE = re.compile(r"^FLEX\|[^|]*\|([^|]*)\|[^|]*\|(\d+)\|([A-Z]+)\|(.*)$")
-_FLEX_TEXT = re.compile(r"^FLEX:\s*\S+\s+\S+\s+(\S+)\s+\S+\s+\[(\d+)\]\s+([A-Z]+)\s*(.*)$")
 MAX_TEXT = 300
 
 
@@ -41,63 +32,6 @@ def clean_text(s, limit=MAX_TEXT):
     """Radio text is untrusted: printable characters only, bounded length."""
     s = str(s if s is not None else "").replace("\n", " ").replace("\r", " ").replace("\t", " ")
     return "".join(c for c in s if c.isprintable()).strip()[:limit]
-
-
-def parse_pager_line(line):
-    """multimon-ng output line -> {"proto","address","text","kind"} or None for chatter/noise."""
-    line = (line or "").strip()
-    m = _POCSAG.match(line)
-    if m:
-        proto, addr, func, kind, text = m.groups()
-        return {"proto": proto, "address": addr, "function": int(func), "kind": (kind or "tone").lower(),
-                "text": clean_text(text)}
-    m = _FLEX_PIPE.match(line) or _FLEX_TEXT.match(line)
-    if m:
-        cfg, addr, kind, text = m.groups()
-        return {"proto": "FLEX", "address": addr.lstrip("0") or "0", "function": None,
-                "kind": {"ALN": "alpha", "NUM": "numeric", "TON": "tone", "BIN": "binary"}.get(kind, kind.lower()),
-                "text": clean_text(text), "cfg": cfg}
-    return None
-
-
-class PagerJob:
-    kind = "pager"
-    label = "Pagers"
-    default_mhz = 929.6125
-    MAX_MESSAGES = 300
-
-    def __init__(self, clock=time.time):
-        self.clock = clock
-        self.messages = deque(maxlen=self.MAX_MESSAGES)
-        self.count = 0
-        self.addresses = {}
-        self.started = clock()
-
-    def command(self, mhz, gain=40):
-        rtl = ["rtl_fm", "-f", f"{mhz}M", "-M", "fm", "-s", "22050", "-g", str(gain), "-E", "dc", "-A", "fast", "-"]
-        mm = ["multimon-ng", "-t", "raw", "-a", "POCSAG512", "-a", "POCSAG1200", "-a", "POCSAG2400", "-a", "FLEX",
-              "-f", "alpha", "-"]
-        return shell_pipe(rtl, mm)
-
-    def feed(self, line):
-        p = parse_pager_line(line)
-        if not p:
-            return False
-        p["ts"] = self.clock()
-        self.count += 1
-        if len(self.messages) == self.messages.maxlen:
-            expired = self.messages[0]["address"]
-            self.addresses[expired] -= 1
-            if not self.addresses[expired]:
-                del self.addresses[expired]
-        self.addresses[p["address"]] = self.addresses.get(p["address"], 0) + 1
-        self.messages.append(p)
-        return True
-
-    def view(self):
-        top = sorted(self.addresses.items(), key=lambda kv: -kv[1])[:8]
-        return {"kind": self.kind, "count": self.count, "messages": list(self.messages)[-120:][::-1],
-                "top_addresses": [{"address": a, "n": n} for a, n in top], "started": self.started}
 
 
 # ---- 433 MHz sensors ------------------------------------------------------------------------------------
@@ -165,7 +99,7 @@ def finite_number(value):
 class SensorJob:
     kind = "sensors"
     label = "433 MHz sensors"
-    default_mhz = 433.92
+    default_mhz = AUTO
     MAX_DEVICES = 60
 
     def __init__(self, clock=time.time):
@@ -175,8 +109,13 @@ class SensorJob:
         self.started = clock()
         self.frames = 0
 
-    def command(self, mhz, gain=40):
-        return shell_pipe(["rtl_433", "-f", f"{mhz}M", "-g", str(gain), "-F", "json", "-M", "level"])
+    def command(self, mhz, gain=40, wrap=None):
+        """`mhz` is a frequency, or AUTO to let rtl_433 hop between AUTO_FREQS every AUTO_HOP_S seconds."""
+        freqs = AUTO_FREQS if mhz == AUTO else (mhz,)
+        argv = ["rtl_433", *[a for f in freqs for a in ("-f", f"{f}M")]]
+        if len(freqs) > 1:
+            argv += ["-H", str(AUTO_HOP_S)]
+        return shell_pipe((wrap or list)([*argv, "-g", str(gain), "-F", "json", "-M", "level"]))
 
     def feed(self, line):
         dev, why = parse_sensor_line(line)
@@ -205,8 +144,8 @@ class SensorJob:
         return {"kind": self.kind, "devices": devs, "ignored": self.ignored, "frames": self.frames, "started": self.started}
 
 
-JOBS = {"pager": PagerJob, "sensors": SensorJob}
-PRESETS = {"pager": PAGER_PRESETS, "sensors": SENSOR_PRESETS}
+JOBS = {"sensors": SensorJob}
+PRESETS = {"sensors": SENSOR_PRESETS}
 
 
 def shell_pipe(*commands):

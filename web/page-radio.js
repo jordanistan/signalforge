@@ -1,6 +1,6 @@
 'use strict';
 /* Radio page: survey results as spectrum charts, a tuner with a live audio scope, presets and bookmarks.
-   Receive only. The dongle does one job at a time (survey, listen, aircraft, pagers, sensors). */
+   Receive only. The dongle does one job at a time (survey, listen, aircraft, sensors). */
 
 const RADIO_PRESETS = [
   ['NOAA Weather', 162.4], ['NOAA WX 2', 162.55], ['2 m calling', 146.52], ['146.94 repeater', 146.94], ['MURS 1', 151.82], ['MURS 3', 151.94],
@@ -116,9 +116,9 @@ const radioPage = {
     const btn = $('#rp-toggle');
     const survey = sdrCapability('survey'), audio = sdrCapability('audio');
     btn.disabled = !S.connected || (!r?.enabled && !survey.available);
-    btn.title = survey.available ? '' : survey.error;
+    btn.title = survey.available ? (r?.enabled ? '' : sdrTakeoverHint('survey')) : survey.error;
     $('#rp-listen').disabled = !audio.available;
-    $('#rp-listen').title = audio.available ? '' : audio.error;
+    $('#rp-listen').title = audio.available ? sdrTakeoverHint('audio') : audio.error;
     for (const b of document.querySelectorAll('#rp-presets button')) b.disabled = !audio.available;
     btn.textContent = r?.enabled ? '■ Stop survey' : '▶ Start survey';
     btn.classList.toggle('danger', !!r?.enabled); btn.classList.toggle('primary', !r?.enabled);
@@ -176,16 +176,30 @@ const radioPage = {
     rows = sortBy(rows, RP.sort, RP.dir, { mhz: c => c.mhz, label: c => (c.label || c.band).toLowerCase(), duty: c => c.duty, peak: c => c.peak_db });
     for (const th of document.querySelectorAll('#rp-table th')) { th.classList.toggle('sorted', th.dataset.k === RP.sort); th.classList.toggle('asc', th.dataset.k === RP.sort && RP.dir === 1); }
     const body = $('#rp-body');
+    const focused = document.activeElement?.closest?.('#rp-body tr.row')?.dataset.mhz; // re-rendering must not drop keyboard focus
     body.replaceChildren();
     if (!rows.length) body.append(el('tr', {}, el('td', { colspan: 5, class: 'empty', text: 'No channels yet.' })));
     for (const c of rows) {
       const on = r.listening != null && Math.abs(r.listening - c.mhz) < 0.0005;
-      body.append(el('tr', { class: 'row' + (on ? ' sel' : '') },
+      const why = c.digital ? 'Digital: not audible as analog FM' : !audio.available ? audio.error || 'Audio is not available' : '';
+      // The whole row tunes (people click the frequency or the name); a row that can't play fills the frequency
+      // box and says why instead.
+      const pick = () => {
+        $('#rp-mhz').value = c.mhz;
+        if (on) return;
+        if (c.digital) { toast('Digital channel', `${c.mhz.toFixed(4)} MHz carries digital traffic, which is not audible as analog FM.`, null, true); return; }
+        tune(c.mhz); // explains itself when audio is unavailable
+      };
+      const tr = el('tr', { class: 'row' + (on ? ' sel' : '') + (why ? ' muted' : ''), tabindex: 0, dataset: { mhz: String(c.mhz) },
+        title: on ? 'Playing now' : why || `Listen to ${c.mhz.toFixed(4)} MHz`, 'aria-label': `${c.mhz.toFixed(4)} MHz ${c.label || c.band}${why ? ` (${why})` : ''}`,
+        onclick: pick, onkeydown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } } },
         el('td', {}, el('b', { text: `${c.mhz.toFixed(4)} MHz` })), el('td', { text: `${c.label || c.band}${c.digital ? ' · digital' : ''}` }),
         el('td', { class: 'num' }, el('span', { class: 'duty' }, el('b', { style: `width:${Math.round(c.duty * 100)}%` })), ` ${Math.round(c.duty * 100)}%`),
         el('td', { class: 'num', text: `+${c.peak_db} dB` }),
-        el('td', {}, on ? el('button', { class: 'btn small', onclick: stopTune, text: '■ Stop' })
-          : el('button', { class: 'btn small', disabled: c.digital || !audio.available, title: c.digital ? 'digital: not audible as analog FM' : 'Listen', onclick: () => { $('#rp-mhz').value = c.mhz; tune(c.mhz); }, text: '▶ Listen' }))));
+        el('td', {}, on ? el('button', { class: 'btn small', tabindex: -1, onclick: e => { e.stopPropagation(); stopTune(); }, text: '■ Stop' })
+          : el('button', { class: 'btn small', tabindex: -1, disabled: !!why, title: why || 'Listen', onclick: e => { e.stopPropagation(); pick(); }, text: '▶ Listen' })));
+      body.append(tr);
+      if (focused === String(c.mhz)) tr.focus();
     }
   },
 };

@@ -14,8 +14,7 @@ verified in this workspace; this is not a complete transitive lockfile.
 | Terminal interface | textual | Interactive terminal |
 | SDR survey | Core | rtl_power |
 | FM audio | Core | rtl_fm, ffmpeg |
-| Aircraft | pyModeS | rtl_adsb |
-| Pager decoder | Core | rtl_fm, multimon-ng |
+| Aircraft | pyModeS | readsb, dump1090-fa, dump1090 or rtl_adsb (first found) |
 | Environmental sensors | Core | rtl_433 |
 | Satellite tracking | skyfield | CelesTrak for initial/updated orbital elements |
 | Weather | aiohttp | api.weather.gov |
@@ -30,11 +29,25 @@ or that it is free; busy/missing device errors appear when starting the selected
 ## Launch and stop
 
 ```sh
+make run LOCATION=30.267,-97.743                     # full console (SERIAL, HTTP_PORT also settable)
+make run-bridge LOCATION=30.267,-97.743 ALLOW='!02ecdcdc'
 .venv/bin/python tools/meshweb.py --home 30.267,-97.743
 .venv/bin/python tools/meshweb.py --demo --http-port 8766
 .venv/bin/python tools/meshweb.py --bridge --allow '!02ecdcdc'
 .venv/bin/python tools/mesh-bridge.py --allow '!02ecdcdc'
 ```
+
+Add `--debug-ui` to log browser clicks, page changes, JavaScript errors and failed tiles as `UIDEBUG` lines
+and to `ui-debug.jsonl` in the state directory. Logging is limited to 20 events per second (burst 40;
+excess is reported as `UIDEBUG dropped N events`), and the file rotates to `ui-debug.jsonl.1` at 5 MB. See [USER-GUIDE.md](USER-GUIDE.md#troubleshooting).
+
+The server binds the HTTP port before opening the radio; if the port is busy it exits with status 3 and
+a plain message, leaving the running copy untouched. On start it makes the state directory and `outbox/`
+owner-only (0700) and creates new files owner-only.
+
+`deploy/signalforge.service` runs the console (without bridge) as a systemd user service; install steps are
+in the README and in the unit file. Stop it (`systemctl --user stop signalforge`) before a bridge, TUI or
+headless-bridge session.
 
 Run only one live serial interface at a time. Stop with Ctrl+C; normal cleanup closes the serial radio,
 browser connections, feed tasks, and any owned SDR processes. Unplugging a serial device leaves the
@@ -45,14 +58,15 @@ If startup reports `Could not exclusively lock port`, another Meshtastic client 
 Stop that client (including a second SignalForge terminal or bridge), reconnect the device, and let the
 web console retry its connection.
 
-SDR modes are mutually exclusive: survey, audio, aircraft, pager, and sensors. Switching modes releases
-the previous process. Closing an older audio stream cannot stop a newer one. Stop buttons and unavailable
-states reflect the selected mode and its dependencies. Pager/sensor traffic and decoder diagnostics stay
-in bounded memory; radio survey summaries are saved in `run/radio-activity.json`.
+SDR modes are mutually exclusive: survey, audio, aircraft, and sensors. Switching modes releases
+the previous process. Receivers run under `setpriv --pdeathsig` when available, so they exit if the server
+is killed and do not keep the dongle. Closing an older audio stream cannot stop a newer one. Stop buttons and unavailable
+states reflect the selected mode and its dependencies. Sensor traffic and decoder diagnostics stay
+in bounded memory; radio survey summaries are saved in `radio-activity.json` in the state directory.
 
 Use `--no-radio --no-weather --no-sats` for mesh-only operation without optional network feeds.
-The street-map layer and radar images still require internet when requested in the browser; choose
-the offline vector map to use `data/basemap.json`.
+The Satellite (Esri) and Streets (OpenStreetMap) map layers and the NWS radar image still require internet
+when requested in the browser; choose the Offline vector base to use `data/basemap.json`.
 
 ## State and recovery
 
@@ -63,12 +77,13 @@ the offline vector map to use `data/basemap.json`.
 | `run/follows.json` | Follow requests, expiry, checks, and reported-message budget |
 | `run/outbox/` | Pending bridge replies; `.tmp` files are not consumed |
 | `run/web-url.txt` | Private token URL (mode 0600); reused on restart |
+| `run/ui-debug.jsonl` | Browser event log, written only with `--debug-ui` (no token or typed text) |
 | `run/demo/` | Separate demo messages, nodes, follows, outbox, and token URL |
 | `data/tle/` | Validated orbital-element cache |
 | `backups/` | Exported radio configuration, potentially including private keys |
 
-`--state-dir` moves the mesh runtime files. SDR survey output and the orbital cache retain the paths
-listed above. The standalone scanner and TUI also retain their default runtime paths.
+`--state-dir` moves the mesh runtime files and the SDR survey summary (`radio-activity.json`). The orbital
+cache keeps the path listed above. The standalone scanner and TUI also retain their default runtime paths.
 Use `--new-token` to rotate web access, then reopen the newly printed URL.
 
 JSONL history skips malformed rows and continues reading later messages. Delivery journal records
@@ -115,7 +130,7 @@ Automated verification uses fake hardware and canned external data. With the int
 4. Start each installed SDR mode, switch modes, stop it, and confirm another receiver can acquire the dongle.
 5. Test live audio, reception with the intended antenna, weather refresh, and current orbital-element downloads.
 
-Firmware upgrades remain a separate explicit operation. Review the existing upgrade section in the README,
+Firmware upgrades remain a separate explicit operation. Review `tools/upgrade-heltec-v3.sh`,
 verify the exact board/image, and retain the configuration backup. Implementation/testing here never flashes hardware.
 
 ## Sharing the workspace

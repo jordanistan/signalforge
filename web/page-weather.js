@@ -13,6 +13,58 @@ function weatherSectionNote(data, key) {
   return el('div', { class: 'note section-status', role: 'status', dataset: { section: key }, text: `${names[key]} ${key === 'alerts' ? 'are' : 'is'} ${status === 'stale' ? 'stale; showing the last available data.' : 'unavailable.'}${data.errors?.[key] ? ` ${data.errors[key]}` : ''}` });
 }
 
+// ---- radar pop-out: the same loop image, as large as the window allows -----------------------------------
+function closeRadarModal() { WP.closeModal?.(); }
+function openRadarModal() {
+  const d = S.weather?.data, img = $('#wp-radar');
+  if (!d?.radar || WP.radarErr || !img?.src || $('#wp-radar-modal')) return;
+  const back = document.activeElement;
+  const fetched = WP.radarAt ? ` · fetched ${new Date(WP.radarAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` : '';
+  const closeBtn = el('button', { class: 'btn modal-close', id: 'wp-radar-close', 'aria-label': 'Close the radar', title: 'Close (Esc)', text: '✕' });
+  const dialog = el('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'wp-radar-title' },
+    el('div', { class: 'modal-head' },
+      el('div', {}, el('h2', { id: 'wp-radar-title', text: `NWS radar ${d.radar}` }), el('span', { class: 'dim', text: `Loop of the last hour · ${d.place}${fetched}` })),
+      closeBtn),
+    el('img', { class: 'modal-img', id: 'wp-radar-big', src: img.src, alt: `NWS radar loop for ${d.radar}, last hour`, referrerpolicy: 'no-referrer' }));
+  const shade = el('div', { class: 'modal-backdrop', id: 'wp-radar-modal', onclick: e => { if (e.target === shade) close(); } }, dialog);
+  const onKey = e => {
+    if (e.key === 'Escape') { e.preventDefault(); close(); }
+    else if (e.key === 'Tab') { e.preventDefault(); closeBtn.focus(); } // the close button is the only control: keep focus in the dialog
+  };
+  function close() {
+    WP.closeModal = null;
+    document.removeEventListener('keydown', onKey, true);
+    shade.remove();
+    if (back?.isConnected) back.focus();
+  }
+  closeBtn.addEventListener('click', close);
+  document.addEventListener('keydown', onKey, true);
+  WP.closeModal = close;
+  document.body.append(shade);
+  closeBtn.focus();
+}
+
+// ---- getting weather on the handheld: live bridge / follow status and the steps, in plain words ------------
+function renderHandheld() {
+  const host = $('#wp-handheld');
+  if (!host) return;
+  const names = (S.allow || []).map(id => nodeName(id));
+  const wx = (S.follows || []).filter(f => /weather/i.test(f.topic || ''));
+  const status = S.bridge
+    ? `Bridge: on · ${names.length ? `${names.length > 1 ? 'handhelds' : 'handheld'} ${names.join(', ')} can use it` : 'no handheld is allowed yet'}`
+    : 'Bridge: off';
+  const code = t => el('code', { text: t });
+  host.replaceChildren(
+    el('div', { class: 'hh-status' + (S.bridge ? ' on' : ''), id: 'wp-bridge', role: 'status' }, el('i'), el('b', { text: status })),
+    ...wx.map(f => el('div', { class: 'crow hh-follow' }, el('b', { text: nodeName(f.node) }), el('span', { class: 'x', text: `following “${f.topic}”` }),
+      el('span', { class: 't', text: `ends in ${fmtDur(Math.max(0, f.expires - nowSec()))}` }))),
+    el('ol', { class: 'hh-steps' },
+      el('li', {}, 'Start SignalForge with ', code("--bridge --allow '!<your handheld id>'"), ' and keep a Claude session running it (see the README).'),
+      el('li', {}, 'From the handheld, text ', code('follow weather <place>'), ', for example ', code('follow weather austin'), '.'),
+      el('li', {}, 'Claude checks about every 15 minutes and texts only when there is something new. Text ', code('following'), ' to list what you follow and ', code('unfollow'), ' to stop. A follow ends by itself after 6 hours (text it again to renew); up to 3 at a time.')),
+    el('div', { class: 'dim hh-alerts', text: 'NWS alerts are shown at the top of this page. With the bridge on, new alerts are printed for the Claude session to relay; the server does not text them to the handheld by itself.' }));
+}
+
 const weatherPage = {
   build(sec) {
     const sh = pageShell('Weather', el('span', { id: 'wp-place', style: 'font-weight:600' }), el('span', { id: 'wp-upd', class: 'dim' }), el('span', { class: 'grow' }),
@@ -23,9 +75,13 @@ const weatherPage = {
         box('Right now', el('div', { id: 'wp-now' }), { span: true }),
         box('Next 24 hours', el('div', {}, el('div', { id: 'wp-hourly-status' }), el('div', { class: 'hourly', id: 'wp-hourly' })), { span: true }),
         box('Forecast', el('div', {}, el('div', { id: 'wp-forecast-status' }), el('div', { class: 'days', id: 'wp-days' })), { span: true }),
-        box('Radar', el('div', {}, el('div', { class: 'dim', id: 'wp-radar-cap', style: 'margin-bottom:6px' }), el('img', { class: 'radar-img', id: 'wp-radar', alt: 'Radar loop', referrerpolicy: 'no-referrer', onerror: () => { WP.radarErr = true; weatherPage.render(); } }))),
+        box('Radar', el('div', {}, el('div', { class: 'dim', id: 'wp-radar-cap', style: 'margin-bottom:6px' }),
+          el('img', { class: 'radar-img', id: 'wp-radar', alt: 'Radar loop (click to enlarge)', title: 'Click to enlarge', role: 'button', tabindex: 0, referrerpolicy: 'no-referrer',
+            onerror: () => { WP.radarErr = true; weatherPage.render(); }, onclick: openRadarModal,
+            onkeydown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openRadarModal(); } } })),
+          { action: el('button', { id: 'wp-radar-open', class: 'btn small', title: 'Show the radar loop full size', onclick: openRadarModal, text: '⤢ Enlarge' }) }),
         box('Nearby weather stations (433 MHz)', el('div', { id: 'wp-433' })),
-        box('Get this on your handheld', el('div', { class: 'dim', text: 'An allowed handheld can request “follow weather” when the bridge is enabled. Updates require an active assistant session to check the topic and send replies. Weather alerts appear above when refreshed.' }))));
+        box('Weather on your handheld', el('div', { id: 'wp-handheld' }))));
     sec.append(sh.root);
   },
   tick() { weatherPage.render(); },
@@ -37,7 +93,8 @@ const weatherPage = {
     $('#wp-refresh').disabled = !S.connected || unavailable;
     $('#wp-nwr').disabled = !sdrCapability('audio').available;
     $('#wp-nwr').title = sdrCapability('audio').available ? 'Listen to NOAA Weather Radio (162.400 MHz)' : sdrCapability('audio').error;
-    $('#wp-err').replaceChildren(...(error ? [el('div', { class: 'err-note', role: 'alert', style: 'margin-bottom:12px', text: error })] : []));
+    // A service that is switched off is a setting, not a failure: say so calmly; real fetch errors stay red.
+    $('#wp-err').replaceChildren(...(error ? [el('div', unavailable && !W?.error ? { class: 'note', role: 'status', style: 'margin-bottom:12px', text: error } : { class: 'err-note', role: 'alert', style: 'margin-bottom:12px', text: error })] : []));
     $('#wp-place').textContent = d ? `${d.place} · NWS ${d.office}${S.location?.source === 'assumed' ? ' · assumed location' : ''}` : unavailable ? 'Unavailable' : W?.error ? 'Weather unavailable' : 'Loading…';
     $('#wp-upd').textContent = W?.updated ? `updated ${ago(W.updated)} ago` : '';
     const alerts = $('#wp-alerts');
@@ -102,13 +159,17 @@ const weatherPage = {
     if (WP.radarStation !== d?.radar) { WP.radarStation = d?.radar; WP.radarErr = false; WP.radarKey = ''; }
     if (d?.radar && !WP.radarErr) {
       const key = `${d.radar}:${Math.floor(Date.now() / 300000)}`; // refresh the loop every 5 minutes
-      if (WP.radarKey !== key) { WP.radarKey = key; img.src = `https://radar.weather.gov/ridge/standard/${d.radar}_loop.gif?${key.split(':')[1]}`; }
+      if (WP.radarKey !== key) { WP.radarKey = key; WP.radarAt = Date.now(); img.src = `https://radar.weather.gov/ridge/standard/${d.radar}_loop.gif?${key.split(':')[1]}`; }
       $('#wp-radar-cap').textContent = `NWS radar ${d.radar} (loop of the last hour)`;
       img.classList.remove('hidden');
+      $('#wp-radar-open').disabled = false;
     } else {
       img.classList.add('hidden');
-      $('#wp-radar-cap').textContent = WP.radarErr ? 'The radar image could not be loaded (needs the internet).' : 'No radar station for this location.';
+      $('#wp-radar-open').disabled = true;
+      closeRadarModal();
+      $('#wp-radar-cap').textContent = WP.radarErr ? 'The radar image could not be loaded (needs the internet).' : d ? 'No radar station for this location.' : 'No radar without weather data.';
     }
+    renderHandheld();
     // 433 MHz
     const s = $('#wp-433');
     s.replaceChildren();

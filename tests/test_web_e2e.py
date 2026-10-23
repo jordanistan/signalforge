@@ -513,6 +513,46 @@ def test_security_headers_are_sent(srv, page):
     h = r.headers
     assert "default-src 'self'" in h["content-security-policy"] and "script-src 'self'" in h["content-security-policy"]
     assert h["x-frame-options"] == "DENY" and h["x-content-type-options"] == "nosniff"
+    assert h["referrer-policy"] == "no-referrer"
+    assert re.search(r'src="/assets/pages\.js\?v=[0-9a-f]{12}"', page.content())  # updates bypass stale caches
+    r = page.goto(f"{srv.url}/assets/pages.js")
+    assert r.headers["cache-control"] == "no-cache"  # an updated UI is never hidden behind a stale cached copy
+
+
+def test_osm_tiles_send_only_the_origin_as_referer(srv, ctx):
+    seen = []
+    page = ctx.new_page()
+    page.on("request", lambda r: seen.append(r.headers.get("referer")) if "tile.openstreetmap.org" in r.url else None)
+    page.add_init_script("try{localStorage.setItem('mesh.base','Streets')}catch(e){}")  # satellite is the default
+    page.goto(f"{srv.url}/?token={TOKEN}")
+    page.click("#view-map")
+    page.wait_for_function("document.querySelectorAll('#map .leaflet-tile').length > 0")
+    assert seen and all(ref == f"{srv.url}/" for ref in seen), seen  # never the ?token= URL, never missing
+
+
+def test_debug_ui_reports_clicks_pages_and_errors_without_the_token(tmp_path, ctx):
+    with LiveServer(tmp_path) as srv:
+        page = ctx.new_page()
+        page.goto(f"{srv.url}/?token={TOKEN}")
+        expect(page.locator("#status")).to_have_text("connected")
+        page.click("#nav-nodes")
+        time.sleep(0.5)
+        assert not [line for line in srv.out if line.startswith("UIDEBUG")]  # off unless --debug-ui
+
+        srv.hub.debug_ui_path = str(tmp_path / "ui-debug.jsonl")
+        page.reload()
+        expect(page.locator("#status")).to_have_text("connected")
+        page.click("#nav-nodes")
+        page.evaluate("setTimeout(() => { throw new Error('boom <x>') })")
+        lines = lambda: [line for line in srv.out if line.startswith("UIDEBUG")]
+        deadline = time.time() + 8
+        while time.time() < deadline and not any('"ev":"page"' in x and '"page":"nodes"' in x for x in lines()):
+            time.sleep(0.2)
+        text = "\n".join(lines())
+        assert '"ev":"click"' in text and '"id":"nav-nodes"' in text
+        assert '"ev":"js-error"' in text and "boom" in text
+        assert '"newNodesPage":true' in text and '"nodesMap":{"present":true' in text
+        assert TOKEN not in text and TOKEN not in (tmp_path / "ui-debug.jsonl").read_text()
 
 
 # ---- resilience ---------------------------------------------------------------------------------------
@@ -546,6 +586,42 @@ def test_node_updates_are_pushed_live(srv, page):
     expect(marker(page, "!55555555")).to_have_count(1)
     del srv.radio._nodes["!55555555"]
     expect(marker(page, "!55555555")).to_have_count(0, timeout=5000)
+
+
+def test_nodes_page_radar_map_shows_rings_reach_and_side_list(srv, page):
+    srv.radio._nodes["!66666666"] = node("Near", "Near Direct", NOW - 120, 30.28, -97.75, hops=0, snr=3.0)  # ~1.2 km north
+    open_app(srv, page)
+    page.click("#nav-nodes")
+    expect(page.locator("#np-map .leaflet-tile-pane img").first).to_be_attached()
+    assert "arcgisonline" in page.locator("#np-map .leaflet-tile-pane img").first.get_attribute("src")  # satellite by default
+    expect(page.locator("#np-map .nm-ring").first).to_be_attached()
+    expect(page.locator("#np-map .nm-reach")).to_have_count(1)
+    expect(page.locator("#np-map .nm-link.good")).to_have_count(1)
+    expect(page.locator("#np-map .nm-radar")).not_to_have_class(re.compile("hidden"))
+    expect(page.locator("#np-legend")).to_contain_text("Direct reach 1.2 km")
+    expect(page.locator("#np-map .node-label", has_text=EVIL_SHORT)).to_have_count(1)  # hostile names stay text
+    first = page.locator("#np-body tr.row").first
+    expect(first).to_have_attribute("data-id", "!66666666")  # sorted nearest first
+    first.click()
+    expect(page.locator("#detail")).to_contain_text("Near Direct")
+    assert not [m for m in page.console_msgs if m[0] == "pageerror"]
+
+
+def test_every_map_carries_the_radar_overlay_and_the_command_center_has_map_widgets(srv, page):
+    open_app(srv, page, view="command")
+    page.click("#nav-dashboard")
+    page.click("#view-cmd")
+    for card in ("#card-meshmap", "#card-air"):
+        expect(page.locator(f"{card} .nm-radar")).not_to_have_class(re.compile("hidden"))
+        expect(page.locator(f"{card} .nm-ring").first).to_be_attached()
+    expect(page.locator("#card-meshmap .leaflet-interactive.node-marker").first).to_be_attached()
+    page.click("#view-map")
+    expect(page.locator("#map .nm-radar")).not_to_have_class(re.compile("hidden"))
+    for name, sel in (("nodes", "#np-map"), ("air", "#page-air"), ("sky", "#sky-map")):
+        page.click(f"#nav-{name}")
+        expect(page.locator(f"{sel} .nm-radar")).not_to_have_class(re.compile("hidden"))
+        expect(page.locator(f"{sel} .nm-ring").first).to_be_attached()
+    assert not [m for m in page.console_msgs if m[0] == "pageerror"]
 
 
 # ---- map layers, theme ------------------------------------------------------------------------------
@@ -668,7 +744,7 @@ def test_command_center_renders_hostile_text_as_text(tmp_path, ctx):
         expect(page.locator("#card-feed")).to_contain_text(EVIL_SHORT)
         page.wait_for_timeout(300)
         assert page.evaluate("window.__pwned") is None
-        assert page.locator("#command img").count() == 0
+        assert page.locator("#command img:not(.leaflet-tile)").count() == 0  # map-widget tiles are the only images
         page.close()
 
 
@@ -706,8 +782,8 @@ def test_command_center_airspace_radar_shows_aircraft(tmp_path, ctx):
         page.click("#cmd-air-btn")
         for f in FRAMES:
             srv.adsb.push(f)
-        expect(page.locator("#card-air .radar .dotp")).to_have_count(1, timeout=6000)
-        expect(page.locator("#card-air .radar .sweep")).to_have_count(1)
+        expect(page.locator("#card-air .plane")).to_have_count(1, timeout=6000)  # plane marker on the radar map
+        expect(page.locator("#card-air .nm-radar")).not_to_have_class(re.compile("hidden"))
         expect(page.locator("#card-air .crow").first).to_contain_text("40621D")
         expect(page.locator(".stat", has_text=re.compile(r"^\s*3\s+aircraft"))).to_have_count(1)
         expect(page.locator("#card-feed")).to_contain_text("40621D")  # the newly seen aircraft is announced in the feed
@@ -787,9 +863,8 @@ def test_optional_pages_report_missing_services_and_disable_actions(srv, page):
     page.click("#nav-sky")
     expect(page.locator("#sk-list")).to_contain_text("not enabled")
     expect(page.locator("#sk-refresh")).to_be_disabled()
-    for name in ("pager", "sensors"):
-        page.click(f"#nav-{name}")
-        expect(page.locator(f"#{name}-toggle")).to_be_disabled()
+    page.click("#nav-sensors")
+    expect(page.locator("#sensors-toggle")).to_be_disabled()
     page.click("#nav-radio")
     expect(page.locator("#rp-listen")).to_be_disabled()
     expect(page.locator("#rp-toggle")).to_be_disabled()
@@ -821,37 +896,11 @@ def test_weather_page_displays_forecasts_and_stale_alerts_honestly(tmp_path, pag
         assert not [m for m in page.console_msgs if m[0] == "pageerror"]
 
 
-def test_pager_decoder_validation_filters_pause_and_safe_text(tmp_path, page):
-    with LiveServer(tmp_path, sdr=True) as srv:
-        open_app(srv, page)
-        page.click("#nav-pager")
-        page.fill("#pager-mhz", "929.6125oops")
-        page.click("#pager-toggle")
-        assert not srv.job_cmds
-        assert not page.locator("#pager-mhz").evaluate("e => e.checkValidity()")
-        page.fill("#pager-mhz", "929.6125")
-        page.click("#pager-toggle")
-        expect(page.locator("#pg-status")).to_contain_text("running on 929.6125")
-        srv.loop.call_soon_threadsafe(srv.job.push, "POCSAG1200: Address: 123456 Function: 3 Alpha: <img src=x onerror=window.__pwned=1>")
-        expect(page.locator("#pg-feed .pmsg")).to_have_count(1)
-        expect(page.locator("#pg-feed")).to_contain_text("<img src=x")
-        assert page.locator("#pg-feed img").count() == 0
-        assert page.evaluate("window.__pwned") is None
-        page.click("#pg-pause")
-        srv.loop.call_soon_threadsafe(srv.job.push, "POCSAG1200: Address: 654321 Function: 3 Alpha: Test dispatch")
-        expect(page.locator("#pg-count")).to_contain_text("2 decoded")
-        expect(page.locator("#pg-feed .pmsg")).to_have_count(1)
-        page.click("#pg-pause")
-        expect(page.locator("#pg-feed .pmsg")).to_have_count(2)
-        page.locator("#pg-feed .addr").first.click()
-        expect(page.locator("#pg-feed .pmsg")).to_have_count(1)
-        page.click("#pg-clear")
-        expect(page.locator("#pg-feed .pmsg")).to_have_count(2)
-        page.fill("#pg-q", "no matches")
-        expect(page.locator("#pg-feed")).to_contain_text("No messages match")
-        page.click("#pager-toggle")
-        expect(page.locator("#pg-status")).to_contain_text("stopped")
-        assert not [m for m in page.console_msgs if m[0] == "pageerror"]
+def test_there_is_no_pager_page(srv, page):
+    open_app(srv, page)
+    assert page.locator("#nav-pager").count() == 0
+    page.goto(f"{srv.url}/#/pager")
+    expect(page.locator("#layout")).to_be_visible()  # unknown pages fall back to the Command Center / map
 
 
 def test_sensors_page_shows_real_readings_and_custom_frequency(tmp_path, page):
@@ -871,6 +920,25 @@ def test_sensors_page_shows_real_readings_and_custom_frequency(tmp_path, page):
         expect(page.locator("#sn-grid")).not_to_contain_text("private")
         page.click("#nav-weather")
         expect(page.locator("#wp-433")).to_contain_text("Garden thermometer")
+        assert not [m for m in page.console_msgs if m[0] == "pageerror"]
+
+
+def test_sensors_default_to_auto_scan_and_the_command_center_summarises_them(tmp_path, page):
+    with LiveServer(tmp_path, sdr=True) as srv:
+        open_app(srv, page, view="command")
+        page.click("#nav-dashboard")
+        page.click("#view-cmd")
+        expect(page.locator("#card-sensors")).to_contain_text("Sensor scan is off")
+        page.click("#cmd-sensors-btn")
+        expect(page.locator("#card-sensors")).to_contain_text("433.92 / 315 / 915 MHz (auto)")
+        srv.loop.call_soon_threadsafe(srv.job.push, json.dumps({"model": "Acurite-Tower", "id": 9, "temperature_C": 22, "humidity": 61}))
+        expect(page.locator("#card-sensors .crow")).to_contain_text("Acurite-Tower")
+        expect(page.locator("#card-sensors")).to_contain_text("72°F")
+        page.click("#nav-sensors")
+        expect(page.locator("#sn-status")).to_contain_text("running on 433.92 / 315 / 915 MHz (auto)")
+        assert page.locator("#sensors-mhz").input_value() == "auto"
+        page.click("#sensors-toggle")
+        expect(page.locator("#sn-status")).to_contain_text("idle")
         assert not [m for m in page.console_msgs if m[0] == "pageerror"]
 
 
@@ -906,15 +974,13 @@ def test_messages_stay_unread_when_the_conversation_is_on_a_hidden_page(srv, pag
 def test_page_navigation_and_new_pages_fit_mobile(srv, page):
     page.set_viewport_size({"width": 390, "height": 844})
     open_app(srv, page)
-    for name in ("nodes", "chats", "air", "radio", "weather", "pager", "sensors", "sky"):
+    for name in ("nodes", "chats", "air", "radio", "weather", "sensors", "sky"):
         page.click(f"#nav-{name}")
         expect(page.locator(f"#page-{name}")).to_be_visible()
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), name
         if name in ("air", "radio", "sky"):
             selector = f"#{'page-' + name} .{'air' if name == 'air' else 'radio' if name == 'radio' else 'sky'}-page"
             assert page.locator(selector).evaluate("e => e.scrollWidth <= e.clientWidth + 1"), name
-        if name == "pager":
-            assert page.locator(".decoder-page").evaluate("e => getComputedStyle(e).gridTemplateColumns.split(' ').length") == 1
     page.locator("#nav-sky").focus()
     page.keyboard.press("Home")
     expect(page.locator("#nav-dashboard")).to_be_focused()
@@ -953,14 +1019,11 @@ def test_demo_banner_and_messages_never_claim_transmission(tmp_path, page):
 def test_each_sdr_action_uses_its_own_capability(tmp_path, page):
     with LiveServer(tmp_path, sdr=True) as srv:
         capabilities = {name: {"available": name == "sensors", "error": None if name == "sensors" else f"Missing {name} tools"}
-                        for name in ("survey", "audio", "aircraft", "pager", "sensors")}
+                        for name in ("survey", "audio", "aircraft", "sensors")}
         srv.hub.radio.capabilities = lambda: capabilities
         open_app(srv, page)
         page.click("#nav-sensors")
         expect(page.locator("#sensors-toggle")).to_be_enabled()
-        page.click("#nav-pager")
-        expect(page.locator("#pager-toggle")).to_be_disabled()
-        expect(page.locator("#pg-status")).to_contain_text("Missing pager tools")
         page.click("#nav-radio")
         expect(page.locator("#rp-toggle")).to_be_disabled()
         expect(page.locator("#rp-listen")).to_be_disabled()
@@ -968,3 +1031,258 @@ def test_each_sdr_action_uses_its_own_capability(tmp_path, page):
         page.click("#nav-air")
         expect(page.locator("#ap-toggle")).to_be_disabled()
         expect(page.locator("#ap-status")).to_contain_text("Missing aircraft tools")
+
+
+# ---- UI polish: layout at every width, radar labels, satellite maps, radio rows, weather extras ------------
+def test_no_page_is_wider_than_the_window_at_tablet_widths(srv, page):
+    for width in (1100, 800):
+        page.set_viewport_size({"width": width, "height": 900})
+        open_app(srv, page)
+        for name in ("dashboard", "nodes", "chats", "air", "radio", "weather", "sensors", "sky"):
+            page.click(f"#nav-{name}")
+            assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), (width, name)
+            assert page.evaluate("document.documentElement.scrollLeft === 0 && document.body.scrollLeft === 0"), (width, name)
+        page.click("#nav-dashboard")
+        page.click("#view-map")
+        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), (width, "map")
+        box = page.locator("#view-cmd").bounding_box()
+        assert box["height"] < 40, box  # the view switch never wraps onto two lines
+    assert not [m for m in page.console_msgs if m[0] == "pageerror"]
+
+
+def test_every_map_defaults_to_satellite_and_dark_mode_never_inverts_imagery(srv, page):
+    page.add_init_script("try{localStorage.setItem('mesh.theme','dark')}catch(e){}")
+    open_app(srv, page)
+    expect(page.locator("#map .leaflet-tile-pane img").first).to_be_attached()
+    assert "arcgisonline" in page.locator("#map .leaflet-tile-pane img").first.get_attribute("src")
+    for sel in ("#map", ):
+        filt = page.locator(f"{sel} .leaflet-tile-pane .leaflet-layer").first.evaluate("e => getComputedStyle(e).filter + getComputedStyle(e.parentElement).filter")
+        assert "invert" not in filt, filt
+    page.hover("#map .leaflet-control-layers")
+    page.locator("#map .leaflet-control-layers-base label", has_text="Streets").click()
+    expect(page.locator("#map .tiles-street")).to_have_count(1)
+    assert "invert" in page.locator("#map .tiles-street").evaluate("e => getComputedStyle(e).filter")  # streets get the dark look
+
+
+def test_ring_labels_are_thinned_when_rings_are_small(srv, page):
+    open_app(srv, page)
+    page.click("#nav-nodes")
+    expect(page.locator("#np-map .nm-ring-label").first).to_be_attached()
+    page.evaluate("NM.map.setView(myPos(), 11, { animate: false })")  # km-sized rings are only a few px apart here
+    page.wait_for_timeout(200)
+    visible = page.evaluate("""() => [...document.querySelectorAll('#np-map .nm-ring-label:not(.reach)')]
+        .filter(e => getComputedStyle(e).opacity !== '0').map(e => e.getBoundingClientRect())""")
+    for a, b in zip(visible, visible[1:]):
+        assert abs(a["y"] - b["y"]) >= 20 or abs(a["x"] - b["x"]) >= 60, visible  # shown labels never stack
+    page.evaluate("NM.map.setView(myPos(), 16, { animate: false })")
+    page.wait_for_timeout(200)
+    shown = page.evaluate("[...document.querySelectorAll('#np-map .nm-ring-label:not(.reach)')].filter(e => getComputedStyle(e).opacity !== '0').length")
+    assert shown >= 2  # zoomed in, the rings are far apart and keep their labels
+
+
+def test_satellites_page_uses_the_shared_bases(srv, page):
+    open_app(srv, page)
+    page.click("#nav-sky")
+    expect(page.locator("#sky-map .leaflet-tile-pane img").first).to_be_attached()
+    assert "arcgisonline" in page.locator("#sky-map .leaflet-tile-pane img").first.get_attribute("src")
+    page.hover("#sky-map .leaflet-control-layers")
+    labels = page.locator("#sky-map .leaflet-control-layers-base label").all_inner_texts()
+    assert [t.strip() for t in labels] == ["Satellite", "Streets", "Offline vector"], labels
+    page.locator("#sky-map .leaflet-control-layers-base label", has_text="Streets").click()
+    assert page.evaluate("localStorage.getItem('mesh.sky.base')") == "Streets"
+    expect(page.locator("#sky-map .nm-ring").first).to_be_attached()  # the radar rings stay
+    expect(page.locator("#sk-plot")).to_contain_text("orbital data")  # empty boxes explain themselves
+    expect(page.locator("#sk-pbody")).to_contain_text("orbital data")
+
+
+def test_clicking_a_survey_row_tunes_it_and_explains_when_it_cannot(tmp_path, page):
+    with LiveServer(tmp_path, sdr=True) as srv:
+        caps = {name: {"available": True, "error": None} for name in ("survey", "audio", "aircraft", "sensors")}
+        srv.hub.radio.capabilities = lambda: caps
+        heard = []
+        page.route(re.compile(r".*/api/radio/audio.*"), lambda r: (heard.append(r.request.url), r.fulfill(status=204)))
+        open_app(srv, page)
+        page.click("#nav-radio")
+        page.click("#rp-toggle")
+        row = page.locator("#rp-body tr.row", has_text="162.4000")
+        expect(row).to_be_visible(timeout=6000)
+        expect(row).to_have_css("cursor", "pointer")
+        row.locator("td").first.click()  # the frequency text, not the button
+        expect(page.locator("#rp-mhz")).to_have_value("162.4")
+        page.wait_for_timeout(300)
+        assert heard and "mhz=162.4" in heard[-1], heard
+        n = len(heard)
+        page.locator("#rp-mhz").fill("")
+        row.focus()
+        page.keyboard.press("Enter")  # keyboard works too
+        expect(page.locator("#rp-mhz")).to_have_value("162.4")
+        page.wait_for_timeout(300)
+        assert len(heard) > n
+        caps["audio"] = {"available": False, "error": "Missing audio tools"}
+        page.reload()
+        page.click("#nav-radio")
+        expect(row).to_be_visible(timeout=6000)
+        page.locator("#rp-mhz").fill("")
+        row.locator("td").nth(1).click()
+        expect(page.locator("#rp-mhz")).to_have_value("162.4")
+        expect(page.locator(".toast.error")).to_contain_text("Missing audio tools")
+        assert not [m for m in page.console_msgs if m[0] == "pageerror"]
+
+
+def test_weather_radar_pops_out_and_closes_with_focus_returned(tmp_path, page):
+    with LiveServer(tmp_path, sdr=True) as srv:
+        open_app(srv, page)
+        page.click("#nav-weather")
+        expect(page.locator("#wp-radar-cap")).to_contain_text("KGRK")
+        page.click("#wp-radar")
+        modal = page.locator("#wp-radar-modal")
+        expect(modal).to_be_visible()
+        expect(modal.locator("[role=dialog]")).to_have_attribute("aria-modal", "true")
+        expect(modal).to_contain_text("NWS radar KGRK")
+        expect(modal).to_contain_text("Loop of the last hour")
+        assert page.locator("#wp-radar-big").get_attribute("src") == page.locator("#wp-radar").get_attribute("src")
+        big = page.locator("#wp-radar-big").bounding_box()
+        assert big["width"] > 900, big  # enlarged, near the window size
+        expect(page.locator("#wp-radar-close")).to_be_focused()
+        page.keyboard.press("Tab")
+        expect(page.locator("#wp-radar-close")).to_be_focused()  # focus stays in the dialog
+        page.keyboard.press("Escape")
+        expect(modal).to_have_count(0)
+        expect(page.locator("#wp-radar")).to_be_focused()  # focus goes back to what opened it
+        page.keyboard.press("Enter")  # the image is a keyboard control too
+        expect(modal).to_be_visible()
+        page.mouse.click(5, 5)  # the backdrop closes it
+        expect(modal).to_have_count(0)
+        page.click("#wp-radar-open")
+        expect(modal).to_be_visible()
+        page.click("#wp-radar-close")
+        expect(modal).to_have_count(0)
+        assert not [m for m in page.console_msgs if m[0] == "pageerror"]
+
+
+def test_weather_handheld_box_shows_live_bridge_and_follow_status(tmp_path, page):
+    with LiveServer(tmp_path, bridge=True, allow=["!02ecdcdc"]) as srv:
+        open_app(srv, page)
+        page.click("#nav-weather")
+        expect(page.locator("#wp-bridge")).to_have_text("Bridge: on · handheld dcdc can use it")
+        box = page.locator("#wp-handheld")
+        expect(box).to_contain_text("follow weather austin")
+        expect(box).to_contain_text("every 15 minutes")
+        expect(box).to_contain_text("6 hours")
+        expect(box).to_contain_text("does not text them")
+        srv.radio.on_packet(packet("!02ecdcdc", "follow weather austin"))
+        expect(box.locator(".hh-follow")).to_contain_text("following “weather austin”")
+    with LiveServer(tmp_path / "off") as srv:
+        open_app(srv, page)
+        page.click("#nav-weather")
+        expect(page.locator("#wp-bridge")).to_have_text("Bridge: off")
+        expect(page.locator("#wp-err .note")).to_be_visible()  # a switched-off service is a note, not a red error
+        expect(page.locator("#wp-err .err-note")).to_have_count(0)
+
+
+def test_air_page_names_the_receiver_and_flags_noise_only(tmp_path, page):
+    with LiveServer(tmp_path, sdr=True) as srv:
+        srv.hub.radio.capabilities = lambda: {n: {"available": True, "error": None} for n in ("survey", "audio", "aircraft", "sensors")}
+        open_app(srv, page)
+        page.click("#nav-air")
+        page.evaluate("() => { S.air.receiver = 'readsb'; S.air.stats = { frames: 400, accepted: 0 }; airPage.render(); }")
+        expect(page.locator("#ap-status")).to_contain_text("via readsb")
+        expect(page.locator("#ap-noise")).to_contain_text("Hearing only noise so far")
+        page.evaluate("() => { S.air.stats = { frames: 400, accepted: 12 }; airPage.render(); }")
+        expect(page.locator("#ap-noise")).to_have_count(0)
+        expect(page.locator("#ap-kpis")).not_to_contain_text("null")
+        page.evaluate("() => { delete S.air.receiver; delete S.air.stats; airPage.render(); }")  # older servers
+        expect(page.locator("#ap-status")).not_to_contain_text("via")
+        assert not [m for m in page.console_msgs if m[0] == "pageerror"]
+
+
+def test_reduced_motion_stops_the_sweep_but_keeps_targets_visible(srv, browser):
+    c = browser.new_context(viewport={"width": 1500, "height": 900}, reduced_motion="reduce")
+    c.route(re.compile(r"^(?!http://127\.0\.0\.1).*"), lambda r: r.fulfill(status=200, content_type="image/png", body=BLANK_PNG))
+    page = c.new_page()
+    open_app(srv, page)
+    page.click("#nav-nodes")
+    expect(page.locator("#np-map .nm-blip i").first).to_be_attached()
+    assert page.locator("#np-map .nm-sweep").evaluate("e => getComputedStyle(e).animationName") == "none"
+    assert float(page.locator("#np-map .nm-blip i").first.evaluate("e => getComputedStyle(e).opacity")) > 0.5
+    c.close()
+
+
+def test_radar_animations_stay_phase_locked_across_rerenders_and_page_switches(srv, page):
+    open_app(srv, page, view="command")
+    sweep = page.locator("#card-meshmap .nm-sweep")
+    expect(sweep).to_be_attached()
+    page.wait_for_timeout(400)
+    sweep.evaluate("e => { e.__tag = 1; }")
+    page.wait_for_timeout(2300)  # the Command Center re-renders every second
+    assert sweep.evaluate("e => e.__tag") == 1  # the map card was not rebuilt
+    lock = "e => e.getAnimations().map(a => a.startTime)"
+    assert sweep.evaluate(lock) == [0]
+    page.click("#nav-nodes")
+    blip = page.locator("#np-map .nm-blip i").first
+    expect(blip).to_be_attached()
+    page.wait_for_timeout(300)
+    assert blip.evaluate(lock) == [0] and page.locator("#np-map .nm-sweep").evaluate(lock) == [0]
+    delay = float(blip.evaluate("e => parseFloat(e.style.animationDelay)"))
+    assert 0 <= delay < 6  # the time the beam takes to reach the node's bearing
+    page.click("#nav-dashboard")  # hidden and shown again: CSS restarts the animation, the lock re-pins it
+    page.wait_for_timeout(300)
+    assert sweep.evaluate(lock) == [0]
+    assert not [m for m in page.console_msgs if m[0] == "pageerror"]
+
+
+def test_one_far_node_does_not_set_the_ring_scale(srv, page):
+    srv.radio._nodes["!77777777"] = node("Far", "Far Away", NOW - 60, 39.0, -97.75, hops=3, snr=-12.0)  # ~970 km north
+    open_app(srv, page)
+    expect(marker(page, "!77777777")).to_have_count(1)
+    outer = page.evaluate("meshRadarModel().outer")
+    assert outer <= 20, outer  # rings fit the local nodes (a few km), not the outlier
+    page.click("#nav-nodes")
+    expect(page.locator("#np-body tr.row[data-id='!77777777']")).to_have_count(1)  # still listed
+
+
+def test_satellite_ring_labels_show_at_the_default_view_and_the_beam_is_faint(srv, page):
+    page.set_viewport_size({"width": 1890, "height": 1300})
+    page.add_init_script("try{localStorage.setItem('mesh.view','map')}catch(e){}")
+    page.goto(f"{srv.url}/?token={TOKEN}#/sky")  # before the state (and your position) has arrived
+    labels = page.locator("#sky-map .nm-ring-label")
+    expect(labels).to_have_count(3)
+    page.wait_for_timeout(500)
+    assert all(v == "1" for v in labels.evaluate_all("els => els.map(e => getComputedStyle(e).opacity)"))
+    expect(page.locator("#sky-map .nm-ring-label span", has_text="ISS above horizon")).to_be_visible()
+    expect(page.locator("#sky-map .nm-radar")).to_have_class(re.compile("wide"))
+    page.click("#nav-nodes")
+    expect(page.locator("#np-map .nm-radar")).not_to_have_class(re.compile("wide"))
+
+
+def test_a_program_that_loses_the_dongle_says_so_and_can_resume(tmp_path, page):
+    with LiveServer(tmp_path, sdr=True) as srv:
+        srv.hub.radio.capabilities = lambda: {n: {"available": True, "error": None} for n in ("survey", "audio", "aircraft", "sensors")}
+        open_app(srv, page)
+        page.click("#nav-sensors")
+        page.click("#sensors-toggle")
+        expect(page.locator("#sensors-toggle")).to_have_text("■ Stop", timeout=5000)
+        page.click("#nav-air")
+        expect(page.locator("#ap-toggle")).to_have_attribute("title", "Starting this stops sensor reading.")
+        page.click("#ap-toggle")
+        expect(page.locator("#ap-toggle")).to_have_text("■ Stop tracking", timeout=5000)
+        expect(page.locator("#sdr-lost-air")).to_have_count(0)
+        page.click("#nav-sensors")
+        note = page.locator("#sdr-lost-sensors")
+        expect(note).to_contain_text("Stopped: the dongle was switched to aircraft tracking at")
+        expect(page.locator("#sensors-toggle")).to_have_attribute("title", "Starting this stops aircraft tracking.")
+        note.get_by_role("button", name="▶ Resume").click()
+        expect(page.locator("#sensors-toggle")).to_have_text("■ Stop", timeout=5000)
+        expect(note).to_have_count(0)
+        page.click("#nav-air")
+        expect(page.locator("#sdr-lost-air")).to_contain_text("switched to sensor reading")
+        page.locator("#sdr-lost-air").get_by_role("button", name="Dismiss").click()
+        expect(page.locator("#sdr-lost-air")).to_have_count(0)
+        assert not [m for m in page.console_msgs if m[0] == "pageerror"]
+
+
+def test_radar_rings_use_the_radar_colour_not_the_leaflet_default(srv, page):
+    open_app(srv, page)
+    ring = page.locator("#map .nm-ring").first
+    expect(ring).to_be_attached()
+    assert ring.evaluate("e => getComputedStyle(e).stroke") == "rgba(90, 255, 150, 0.75)"

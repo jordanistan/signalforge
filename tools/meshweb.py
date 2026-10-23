@@ -16,9 +16,11 @@ Usage: tools/meshweb.py [-p PORT] [--http-port 8765] [--bridge] [--allow !nodeid
 """
 import argparse
 import asyncio
+import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -35,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from aiohttp import WSCloseCode, WSMsgType, web  # noqa: E402
 
 from meshcore import (BROADCAST, SerialBackend, is_broadcast, nearest_place, node_class,  # noqa: E402
-                      place_text, position, parse_home, split_for_radio, truncate_utf8,
+                      place_text, position, parse_home, radio_error_hint, split_for_radio, truncate_utf8,
                       MAX_BYTES, BRIDGE_BYTES)
 from radiowatch import DEFAULT_REFERENCE, RadioWatch  # noqa: E402
 from weather import WeatherService  # noqa: E402
@@ -81,12 +83,25 @@ def node_view(nid, n, now, places=None, near_cache=None):
     }
 
 
+def _shorten(value, depth=0):
+    """Bound an untrusted browser-supplied JSON value: short strings, few items, shallow nesting."""
+    if isinstance(value, str):
+        return value[:500]
+    if depth >= 4:
+        return "…"
+    if isinstance(value, dict):
+        return {str(k)[:60]: _shorten(v, depth + 1) for k, v in list(value.items())[:30]}
+    if isinstance(value, list):
+        return [_shorten(v, depth + 1) for v in value[:30]]
+    return value if value is None or isinstance(value, (bool, int, float)) else str(value)[:100]
+
+
 class Hub:
     """Owns the radio, the message log and the connected browsers."""
 
     def __init__(self, backend_factory, log_path=LOG_PATH, allow=(), bridge=False, outbox=OUTBOX,
-                 nodes_json=NODES_JSON, places=None, home=None, out=None, follows_path=None, demo=False):
-        self.backend_factory = backend_factory
+                 nodes_json=NODES_JSON, places=None, home=None, out=None, follows_path=None, demo=False, port=None):
+        self.backend_factory, self.port = backend_factory, port
         self.log_path, self.outbox, self.nodes_json = log_path, outbox, nodes_json
         self.allow, self.bridge, self.places, self.home = list(allow), bridge, places or [], home
         self.out = out or (lambda line: print(line, flush=True))
@@ -106,6 +121,7 @@ class Hub:
         self.weather = None  # optional WeatherService, attached by main()
         self.sats = None  # optional SatTracker, attached by main()
         self.demo = demo
+        self.debug_ui_path = None  # set by --debug-ui: browser clicks/errors are logged here and to stdout
         self.capability_errors = {}
         self._weather_asked = 0.0
         self.follows = FollowStore(follows_path or FOLLOWS_PATH)
@@ -113,6 +129,7 @@ class Hub:
         self.follow_check_secs = 60  # how often expired follows are swept
         self.reconnect_secs = 3  # how often to retry when the radio is missing
         self._reconnecting = False
+        self._poll_error = None
         self.poll_secs = 3  # node table refresh
         self.chunk_delay = 3  # pause between bridge chunks so they arrive in order
 
@@ -124,10 +141,10 @@ class Hub:
             self.backend, self.my_id = await self.loop.run_in_executor(None, self._connect_backend)
             self._hook_backend()
         except Exception as e:  # port busy, no device...
-            self.error = f"Could not open radio: {e}"
+            self.error = radio_error_hint(e, self.port)
             self.out(f"ERROR {self.error}")
             self._begin_reconnect()  # keep trying: the radio may just not be plugged in yet
-        self._poll_nodes_once()
+        self._poll_nodes_safely()
         self._tasks.append(asyncio.create_task(self._poll_nodes()))
         if self.weather:
             await self.weather.start()
@@ -208,12 +225,19 @@ class Hub:
             await asyncio.sleep(self.reconnect_secs)
             try:
                 backend, my_id = await self.loop.run_in_executor(None, self._connect_backend)
-            except Exception:
-                continue  # still missing or busy; the banner already says so
+            except Exception as e:
+                # Still missing or busy. Report only a *change* of reason (e.g. unplugged -> port busy), so the
+                # banner stays accurate without printing the same error every few seconds.
+                error = radio_error_hint(e, self.port)
+                if error != self.error:
+                    self.error = error
+                    self.out(f"ERROR {error}")
+                    await self.broadcast(self.state())
+                continue
             self.backend, self.my_id, self.error = backend, my_id, None
             self._hook_backend()
             self._reconnecting = False
-            self._poll_nodes_once()
+            self._poll_nodes_safely()
             self.out("BRIDGE radio reconnected")
             await self.broadcast(self.state())
             return
@@ -235,10 +259,46 @@ class Hub:
         if self.bridge:
             self.out(f"WEATHER alert {a['severity']}: {a['event']} - {a['headline'][:140]}")
 
+    UI_DEBUG_RATE, UI_DEBUG_BURST = 20.0, 40  # events per second, bucket size
+    UI_DEBUG_MAX_BYTES = 5 * 1024 * 1024  # ui-debug.jsonl rotates to .1 beyond this
+
+    def ui_debug(self, data, now=None):
+        """--debug-ui: one line per browser event (click, page change, error, failed tile). json.dumps escapes
+        control characters, so page text cannot inject terminal sequences. Fields are shortened before encoding
+        (every line stays valid JSON), a token bucket stops a JS error loop from flooding stdout and the disk,
+        and the log file rotates."""
+        if not self.debug_ui_path:
+            return
+        now = time.monotonic() if now is None else now
+        tokens, last, dropped = getattr(self, "_uidebug_bucket", (float(self.UI_DEBUG_BURST), now, 0))
+        tokens = min(float(self.UI_DEBUG_BURST), tokens + (now - last) * self.UI_DEBUG_RATE)
+        if tokens < 1:
+            self._uidebug_bucket = (tokens, now, dropped + 1)
+            return
+        if dropped:
+            self.out(f"UIDEBUG dropped {dropped} events (rate limit)")
+        self._uidebug_bucket = (tokens - 1, now, 0)
+        event = _shorten({k: v for k, v in data.items() if k != "type"})
+        line = json.dumps(event, ensure_ascii=True, separators=(",", ":"))
+        if len(line) > 4000:
+            event = {"truncated": True, "keys": [str(k)[:40] for k in list(event)[:20]]}
+            line = json.dumps(event, ensure_ascii=True, separators=(",", ":"))
+        self.out(f"UIDEBUG {line}")
+        try:
+            if os.path.getsize(self.debug_ui_path) > self.UI_DEBUG_MAX_BYTES:
+                os.replace(self.debug_ui_path, self.debug_ui_path + ".1")
+        except OSError:
+            pass
+        try:
+            with open(self.debug_ui_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"t": round(time.time(), 3), **event}, ensure_ascii=True) + "\n")
+        except OSError:
+            pass
+
     # ---- state -----------------------------------------------------------------------------
     def state(self):
         return {"type": "state", "me": self.my_id, "error": self.error, "nodes": self.nodes,
-                "demo": self.demo, "location": self.location_view(),
+                "demo": self.demo, "bridge": self.bridge, "debug_ui": bool(self.debug_ui_path), "location": self.location_view(),
                 "capabilities": {"weather": self.weather is not None, "sats": self.sats is not None},
                 "capability_errors": self.capability_errors,
                 "messages": list(self.msgs)[-500:], "home": self.home, "allow": self.allow, "now": time.time(),
@@ -324,6 +384,20 @@ class Hub:
             pass
         return changed
 
+    def _poll_nodes_safely(self):
+        """First node read after (re)connecting: a radio that answers the handshake but fails here must not abort
+        startup or leave the reconnect task dead; the periodic poll retries and reports it."""
+        try:
+            return self._poll_nodes_once()
+        except Exception as e:
+            self._report_poll_error(e)
+            return None
+
+    def _report_poll_error(self, e):
+        if str(e) != self._poll_error:  # once per distinct error, not every few seconds
+            self._poll_error = str(e)
+            self.out(f"ERROR node poll: {e}")
+
     async def _poll_nodes(self):
         while True:
             await asyncio.sleep(self.poll_secs)
@@ -336,8 +410,9 @@ class Hub:
                 if fv != self._last_follow_view:
                     self._last_follow_view = fv
                     await self.broadcast({"type": "follows", "follows": fv})
+                self._poll_error = None
             except Exception as e:
-                self.out(f"ERROR node poll: {e}")
+                self._report_poll_error(e)
 
     # ---- messages --------------------------------------------------------------------------
     def _on_packet_thread(self, packet):  # runs on meshtastic's reader thread
@@ -529,7 +604,7 @@ async def guard(request, handler):
 
 
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-       "img-src 'self' data: https://tile.openstreetmap.org https://radar.weather.gov; "
+       "img-src 'self' data: https://tile.openstreetmap.org https://server.arcgisonline.com https://radar.weather.gov; "
        "connect-src 'self' ws://127.0.0.1:* ws://localhost:*; "
        "frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
@@ -543,10 +618,28 @@ async def add_security_headers(request, response):
     response.headers["Referrer-Policy"] = "no-referrer"
     if request.path.startswith("/api/") or request.path == "/":
         response.headers["Cache-Control"] = "no-store"
+    elif request.path.startswith("/assets/"):
+        # Revalidate every load (cheap: ETag/Last-Modified answer 304) so an updated app.js or pages.js
+        # is never hidden behind a heuristically cached old copy.
+        response.headers["Cache-Control"] = "no-cache"
+
+
+def asset_version(rel):
+    """Short content hash of a web asset, or "0" when it is missing."""
+    try:
+        with open(os.path.join(WEB_DIR, rel), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:12]
+    except OSError:
+        return "0"
 
 
 async def index(request):
-    return web.FileResponse(os.path.join(WEB_DIR, "index.html"))
+    # Every /assets/ link carries ?v=<content hash>, so a browser holding an old cached app.js or pages.js
+    # (possibly without any revalidation) always fetches the current file after an update.
+    with open(os.path.join(WEB_DIR, "index.html"), encoding="utf-8") as f:
+        html = f.read()
+    html = re.sub(r'"/assets/([^"?#]+)"', lambda m: f'"/assets/{m.group(1)}?v={asset_version(m.group(1))}"', html)
+    return web.Response(text=html, content_type="text/html")
 
 
 async def api_state(request):
@@ -605,6 +698,9 @@ async def ws_handler(request):
             try:
                 data = json.loads(msg.data)
             except ValueError:
+                continue
+            if isinstance(data, dict) and data.get("type") == "uidebug":
+                hub.ui_debug(data)
                 continue
             if not isinstance(data, dict):
                 continue
@@ -756,6 +852,7 @@ def argument_parser():
     ap.add_argument("--no-weather", action="store_true", help="disable NWS requests")
     ap.add_argument("--no-sats", action="store_true", help="disable satellite calculations and TLE requests")
     ap.add_argument("--state-dir", default=os.path.join(ROOT, "run"), help="runtime state directory (demo uses its demo/ subdirectory)")
+    ap.add_argument("--debug-ui", action="store_true", help="log browser clicks, page changes and errors to stdout (UIDEBUG) and run/ui-debug.jsonl")
     ap.add_argument("--new-token", action="store_true", help="rotate the access token instead of reusing the saved one")
     return ap
 
@@ -768,10 +865,13 @@ def build_hub(a):
         state_dir = os.path.join(state_dir, "demo")
     factory = (lambda on_packet: DemoBackend(on_packet, snapshot=snapshot, home=home)) if a.demo else (lambda on_packet: SerialBackend(a.port, on_packet))
     hub = Hub(factory, allow=a.allow, bridge=a.bridge, places=load_places(), home=home, demo=a.demo,
+              port=None if a.demo else a.port,
               log_path=os.path.join(state_dir, "messages.jsonl"), nodes_json=os.path.join(state_dir, "nodes.json"),
               follows_path=os.path.join(state_dir, "follows.json"), outbox=os.path.join(state_dir, "outbox"))
+    if a.debug_ui:
+        hub.debug_ui_path = os.path.join(state_dir, "ui-debug.jsonl")
     if not a.no_radio and not a.demo:
-        hub.radio = RadioWatch(hub.broadcast, reference=home)
+        hub.radio = RadioWatch(hub.broadcast, reference=home, snapshot=os.path.join(state_dir, "radio-activity.json"))
     if not a.demo and not a.no_weather:
         hub.weather = WeatherService(hub.broadcast, hub.location, on_alert=hub.on_weather_alert)
     else:
@@ -798,16 +898,66 @@ def main():
         hub, state_dir = build_hub(a)
     except ValueError as e:
         ap.error(str(e))
+    # Bind before touching the radio or the token file: a second copy started by mistake must not grab the serial
+    # port (aiohttp runs startup hooks before binding) or rewrite the URL the running copy is serving.
+    try:
+        sock = bind_loopback(a.http_port)
+    except OSError as e:
+        url_hint = os.path.join(state_dir, "web-url.txt")
+        print(f"ERROR Cannot listen on 127.0.0.1:{a.http_port}: {e.strerror or e}. "
+              f"If {PRODUCT_NAME} is already running, open the URL in {url_hint}; "
+              f"otherwise choose another --http-port.", file=sys.stderr, flush=True)
+        sys.exit(EXIT_PORT_IN_USE)
+    try:
+        prepare_state_dir(state_dir)
+    except OSError as e:
+        sock.close()
+        print(f"ERROR State directory {state_dir} is not usable: {e.strerror or e}. "
+              "Pass a writable --state-dir.", file=sys.stderr, flush=True)
+        sys.exit(1)
     url_file = os.path.join(state_dir, "web-url.txt")
     token = load_or_create_token(url_file, rotate=a.new_token)
     url = f"http://127.0.0.1:{a.http_port}/?token={token}"
-    os.makedirs(state_dir, mode=0o700, exist_ok=True)
     fd = os.open(url_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(url + "\n")
     print(f"{PRODUCT_NAME} · {TAGLINE}\nOpen {url}", flush=True)
-    web.run_app(make_app(hub, token), host="127.0.0.1", port=a.http_port, print=None)
+    web.run_app(make_app(hub, token), sock=sock, print=None)
+
+
+EXIT_PORT_IN_USE = 3  # distinct from crashes (1) and bad arguments (2), so a service manager can tell them apart
+
+
+def bind_loopback(port):
+    """A listening loopback socket, or OSError (typically: the port is taken)."""
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", port))
+        sock.listen(128)
+    except OSError:
+        sock.close()
+        raise
+    sock.setblocking(False)
+    return sock
+
+
+def prepare_state_dir(state_dir):
+    """Runtime state is private (messages, node positions, the token URL): new files are created owner-only and
+    an existing directory we own is tightened to 0700. Raises OSError if it cannot be created or written."""
+    os.umask(0o077)
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    st = os.stat(state_dir)
+    if st.st_uid == os.getuid() and st.st_mode & 0o077:
+        os.chmod(state_dir, 0o700)
+    for sub in ("outbox",):
+        path = os.path.join(state_dir, sub)
+        if os.path.isdir(path) and os.stat(path).st_uid == os.getuid() and os.stat(path).st_mode & 0o077:
+            os.chmod(path, 0o700)
+    if not os.access(state_dir, os.W_OK | os.X_OK):
+        raise PermissionError(13, "not writable")
 
 
 if __name__ == "__main__":

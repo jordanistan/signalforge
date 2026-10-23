@@ -602,7 +602,6 @@ def test_adsb_command_uses_fixed_gain_and_line_buffering():
     ({"rtl_power"}, {"survey"}),
     ({"rtl_fm", "ffmpeg"}, {"audio"}),
     ({"rtl_adsb"}, {"aircraft"}),
-    ({"rtl_fm", "multimon-ng"}, {"pager"}),
     ({"rtl_433"}, {"sensors"}),
     (set(), set()),
 ])
@@ -730,8 +729,7 @@ def decoder_watch(broadcast, proc, tmp_path, **kwargs):
 
 
 @pytest.mark.parametrize("kind,line,key", [
-    ("pager", "POCSAG1200: Address: 1234 Function: 3 Alpha: fixture text", "messages"),
-    ("sensors", '{"model":"WeatherStation","id":42,"temperature_C":20.5}', "devices"),
+    ("sensors", '{"model":"WeatherStation","id":42,"temperature_C":20.5,"channel":"fixture text"}', "devices"),
 ])
 async def test_decoder_jobs_publish_and_keep_results_after_stop(tmp_path, kind, line, key):
     events, broadcast = await collect(0)
@@ -751,7 +749,7 @@ async def test_decoder_process_failure_reports_bounded_in_memory_diagnostics(tmp
     events, broadcast = await collect(0)
     proc = FakeAdsbProc(stderr=b"x" * 10000 + b"\nusb_claim_interface error -6")
     radio = decoder_watch(broadcast, proc, tmp_path)
-    await radio.start_job("pager")
+    await radio.start_job("sensors")
     proc.end()
     assert await wait_for(lambda: not radio.job_enabled)
     assert "in use by another program" in radio.job_error
@@ -768,7 +766,7 @@ async def test_decoder_spawn_failure_is_reported_and_disables_mode(tmp_path):
 
     radio = rw.RadioWatch(broadcast, available=True, settle=0, spawn_job=missing, job_check=lambda cls: "",
                          snapshot=str(tmp_path / "radio.json"))
-    await radio.start_job("pager")
+    await radio.start_job("sensors")
     assert await wait_for(lambda: not radio.job_enabled)
     assert radio.job_error == "decoder launch failed" and radio._job_proc is None
     await radio.shutdown()
@@ -778,13 +776,13 @@ async def test_invalid_or_missing_decoder_does_not_interrupt_an_active_job(tmp_p
     events, broadcast = await collect(0)
     proc = FakeAdsbProc()
     radio = decoder_watch(broadcast, proc, tmp_path)
-    await radio.start_job("pager")
-    for kind, frequency in (("unknown", 100), ("sensors", "bad"), ("sensors", 2000)):
+    await radio.start_job("sensors", 433.92)
+    for kind, frequency in (("unknown", 100), ("pager", 929.6125), ("sensors", "bad"), ("sensors", 2000)):
         with pytest.raises(ValueError):
             await radio.start_job(kind, frequency)
-    radio._job_check = lambda cls: "rtl_433 not installed." if cls.kind == "sensors" else ""
-    await radio.start_job("sensors")
-    assert radio.job_enabled and radio.job.kind == "pager" and not proc.killed
+    radio._job_check = lambda cls: "rtl_433 not installed."
+    await radio.start_job("sensors", 915)
+    assert radio.job_enabled and radio.job_mhz == 433.92 and not proc.killed
     assert radio.job_error == "rtl_433 not installed."
     await radio.shutdown()
 
@@ -867,3 +865,101 @@ assert 'pyModeS' in radiowatch.RadioWatch(lambda _: None).capability_error('airc
 """
     result = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+# ---- ADS-B receiver choice and frame statistics ----------------------------------------------------
+def test_adsb_prefers_the_better_demodulators_when_installed():
+    assert rw.adsb_program(lambda n: n in {"rtl_adsb"}) == "rtl_adsb"
+    assert rw.adsb_program(lambda n: n in {"rtl_adsb", "dump1090"}) == "dump1090"
+    assert rw.adsb_program(lambda n: n in {"rtl_adsb", "dump1090-fa", "readsb"}) == "readsb"
+    assert rw.adsb_program(lambda n: False) is None
+
+
+def test_adsb_command_lines_for_each_receiver():
+    assert rw.adsb_cmd(program="readsb", have_stdbuf=True) == ["stdbuf", "-oL", "readsb", "--device-type", "rtlsdr",
+                                                              "--raw", "--gain", "40"]
+    assert rw.adsb_cmd(program="dump1090-fa", have_stdbuf=False)[:4] == ["dump1090-fa", "--device-type", "rtlsdr", "--raw"]
+    assert rw.adsb_cmd(program="dump1090", have_stdbuf=False, gain=0) == ["dump1090", "--raw"]
+
+
+@pytest.mark.parametrize("installed", [{"readsb"}, {"dump1090-fa"}, {"dump1090"}, {"rtl_adsb"}])
+def test_any_adsb_receiver_enables_aircraft_mode(monkeypatch, installed):
+    monkeypatch.setattr(rw.shutil, "which", lambda name: f"/usr/bin/{name}" if name in installed else None)
+    assert rw.RadioWatch(lambda _: None).capability_error("aircraft") == ""
+
+
+def test_missing_adsb_receiver_names_the_alternatives(monkeypatch):
+    monkeypatch.setattr(rw.shutil, "which", lambda name: None)
+    assert "rtl_adsb (or readsb/dump1090)" in rw.RadioWatch(lambda _: None).capability_error("aircraft")
+
+
+async def test_aircraft_stats_break_down_rejected_frames():
+    events, broadcast = await collect(0)
+    proc = FakeAdsbProc()
+    rwatch = air_watch(broadcast, proc)
+    await rwatch.start_aircraft()
+    for line in ["*" + IDENT.lower() + ";\r", "*8d4840d6202cc371c32ce0576000;\r", "*a0001838ca3e51f0a8000047a36a;\r",
+                 "garbage"]:
+        proc.push(line)
+    assert await wait_for(lambda: rwatch.table.frames == 4, 4)
+    stats = rwatch.aircraft_view()["stats"]
+    assert stats["accepted"] == 1 and stats["crc_failed"] == 1 and stats["other_df"] == 1 and stats["malformed"] == 1
+    assert "receiver" in rwatch.aircraft_view()
+    await rwatch.shutdown()
+
+
+def test_survey_snapshot_path_is_configurable(tmp_path):
+    path = tmp_path / "state" / "radio-activity.json"
+    radio = rw.RadioWatch(lambda _: None, snapshot=str(path))
+    assert radio.snapshot == str(path)
+    assert rw.RadioWatch(lambda _: None).snapshot == rw.SNAPSHOT  # tests redirect this away from the live run/
+    assert not rw.SNAPSHOT.startswith(str(Path(rw.ROOT) / "run"))
+
+
+# ---- receivers never outlive a killed server --------------------------------------------------------
+def test_orphan_guard_prefix():
+    assert rw.orphan_guard(["rtl_433", "-f", "433.92M"], have_setpriv=True) == ["setpriv", "--pdeathsig", "TERM",
+                                                                                "rtl_433", "-f", "433.92M"]
+    assert rw.orphan_guard(["rtl_433"], have_setpriv=False) == ["rtl_433"]
+
+
+def test_decoder_pipelines_guard_every_program():
+    wrap = lambda argv: ["G", *argv]  # noqa: E731
+    import decoders
+    assert decoders.SensorJob().command(decoders.AUTO, wrap=wrap).count("G ") == 1
+    assert decoders.SensorJob().command(433.92, wrap=wrap).startswith("G rtl_433 ")
+    assert decoders.SensorJob().command(433.92) == "rtl_433 -f 433.92M -g 40 -F json -M level"
+
+
+@pytest.mark.skipif(not __import__("shutil").which("setpriv"), reason="util-linux setpriv not installed")
+def test_a_killed_server_takes_its_receiver_pipeline_with_it(tmp_path):
+    """Stand-in for a server killed with SIGKILL while a decoder pipeline (sh -c 'a | b') runs: both programs
+    must exit instead of holding the dongle. Uses `sleep` in place of the receivers."""
+    import subprocess
+    pidfile = tmp_path / "receiver.pid"
+    receiver = ["sh", "-c", f"echo $$ > {pidfile}; exec sleep 60"]
+    pipeline = rw.decoders.shell_pipe(rw.orphan_guard(receiver), rw.orphan_guard(["cat"]))
+    owner_code = ("import subprocess, sys, time; "
+                  f"subprocess.Popen({rw.orphan_guard(['sh', '-c', pipeline])!r}, stdout=subprocess.PIPE, "
+                  "start_new_session=True); time.sleep(60)")
+    owner = subprocess.Popen([sys.executable, "-c", owner_code])
+    try:
+        for _ in range(100):
+            if pidfile.exists() and pidfile.read_text().strip():
+                break
+            time.sleep(0.05)
+        receiver_pid = int(pidfile.read_text())
+        owner.kill()  # SIGKILL: no cleanup code runs
+        owner.wait(5)
+        for _ in range(100):
+            try:
+                os.kill(receiver_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            os.kill(receiver_pid, signal.SIGKILL)
+            pytest.fail("receiver outlived its owner")
+    finally:
+        if owner.poll() is None:
+            owner.kill()

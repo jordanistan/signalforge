@@ -140,9 +140,13 @@ function connect() {
   ws.onmessage = ev => { let d; try { d = JSON.parse(ev.data); } catch { return; } handle(d); };
 }
 function handle(d) {
+  handleFrame(d);
+  trackSdrOwner();
+}
+function handleFrame(d) {
   if (d.type === 'state') {
     S.me = d.me; S.error = d.error; S.home = d.home; S.allow = d.allow || []; S.follows = d.follows || []; S.radio = d.radio || null;
-    S.capabilities = d.capabilities || {}; S.capabilityErrors = d.capability_errors || {}; S.demo = !!d.demo; S.location = d.location || null;
+    S.capabilities = d.capabilities || {}; S.capabilityErrors = d.capability_errors || {}; S.demo = !!d.demo; S.bridge = !!d.bridge; S.debugUi = !!d.debug_ui; S.location = d.location || null;
     if (d.aircraft) { S.air = d.aircraft; airIngest(S.air.aircraft); }
     S.job = d.job || null; S.weather = d.weather || null;
     S.nodes = new Map(d.nodes.map(n => [n.id, n]));
@@ -182,14 +186,14 @@ function handle(d) {
     renderRadio(); renderAir(); scheduleCommand(); renderNav(); schedulePage();
   } else if (d.type === 'aircraft') {
     const known = new Set(S.air.aircraft.map(a => a.icao));
-    S.air = { enabled: d.enabled, aircraft: d.aircraft || [], reference: d.reference, reference_assumed: d.reference_assumed, stats: d.stats };
+    S.air = { enabled: d.enabled, aircraft: d.aircraft || [], reference: d.reference, reference_assumed: d.reference_assumed, stats: d.stats, receiver: d.receiver };
     for (const a of S.air.aircraft) if (a.lat != null && !known.has(a.icao) && S.air.aircraft.length < 60) pushEvent('air', `${a.callsign || a.icao} · ${fmtAlt(a.alt_ft)} · ${a.dist_nm} NM`);
     airIngest(S.air.aircraft);
     syncAircraft(); renderAir(); scheduleCommand(); renderNav(); schedulePage();
   } else if (d.type === 'job') {
     const was = S.job;
     S.job = d.job;
-    if (S.booted && d.job && (!was || was.enabled !== d.job.enabled) && d.job.kind) pushEvent('radio', `${d.job.kind === 'pager' ? 'Pager decoder' : 'Sensor decoder'} ${d.job.enabled ? `started on ${d.job.mhz} MHz` : 'stopped'}`);
+    if (S.booted && d.job && (!was || was.enabled !== d.job.enabled) && d.job.kind) pushEvent('radio', `Sensor scan ${d.job.enabled ? `started on ${fmtJobMhz(d.job.mhz)}` : 'stopped'}`);
     renderNav(); scheduleCommand(); schedulePage();
   } else if (d.type === 'weather') {
     const before = new Set((S.weather?.data?.alerts || []).map(a => a.id));
@@ -432,6 +436,7 @@ function renderRadio() {
   }
   btn.disabled = !S.connected || (!r.enabled && !sdrCapability('survey').available);
   btn.textContent = r.enabled ? 'Stop survey' : 'Start survey';
+  btn.title = r.enabled ? '' : sdrTakeoverHint('survey');
   err.classList.toggle('hidden', !r.error);
   err.textContent = r.error || '';
   status.textContent = !r.available ? 'SDR tools not installed'
@@ -481,22 +486,20 @@ function centerOn(id) {
 }
 
 // ---- map -------------------------------------------------------------------------------------------
-let map, nodeLayer, offlineLayer, homeMarker, airLayer;
+let map, nodeLayer, offlineLayer, homeMarker, airLayer, mainRadar;
 const markers = new Map();
 
 function initMap() {
   map = L.map('map', { zoomControl: true, doubleClickZoom: false, attributionControl: true, worldCopyJump: true }).setView([39, -98], 4);
-  const osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap contributors' });
-  offlineLayer = makeOfflineLayer();
-  const bases = { Streets: osm, 'Offline vector': offlineLayer };
-  const saved = localStorage.getItem('mesh.base');
-  const startName = saved && bases[saved] ? saved : 'Streets';
-  bases[startName].addTo(map);
-  syncMapBg(startName);
+  const { bases, labels } = addRadarBases(map, 'mesh.base', { offline: true });
+  offlineLayer = bases['Offline vector'];
+  syncMapBg(Object.keys(bases).find(k => map.hasLayer(bases[k])));
   nodeLayer = L.layerGroup().addTo(map);
   airLayer = L.layerGroup().addTo(map);
-  L.control.layers(bases, { Nodes: nodeLayer, Aircraft: airLayer }, { collapsed: true }).addTo(map);
-  map.on('baselayerchange', e => { localStorage.setItem('mesh.base', e.name); syncMapBg(e.name); });
+  mainRadar = makeRadar();
+  mainRadar.group.addTo(map);
+  L.control.layers(bases, { 'Place labels': labels, 'Radar & rings': mainRadar.group, Nodes: nodeLayer, Aircraft: airLayer }, { collapsed: true }).addTo(map);
+  map.on('baselayerchange', e => syncMapBg(e.name));
   const Btns = L.Control.extend({
     onAdd() {
       const box = L.DomUtil.create('div');
@@ -508,8 +511,7 @@ function initMap() {
     },
   });
   new Btns({ position: 'topleft' }).addTo(map);
-  map.on('zoomend moveend', () => offlineLayer.refreshCities?.());
-  new ResizeObserver(() => map.invalidateSize()).observe($('#map')); // the grid settles after first paint
+  new ResizeObserver(() => { map.invalidateSize(); mainRadar.sweep._update(); }).observe($('#map')); // the grid settles after first paint
 }
 function syncMapBg(name) { $('#map').classList.toggle('offline', name === 'Offline vector'); }
 
@@ -620,6 +622,7 @@ function syncMarkers() {
     });
     if (noPos.length > 6) note.append(` +${noPos.length - 6} more`);
   }
+  syncMeshRadar(mainRadar);
   if (S.home) {
     if (!homeMarker) { homeMarker = L.circleMarker(S.home, { radius: 6, className: 'home-marker' }).bindTooltip('Home'); homeMarker.addTo(map); }
     else homeMarker.setLatLng(S.home);
@@ -678,7 +681,7 @@ function pushEvent(kind, text) {
 function radioMode() {
   const r = S.radio;
   if (!r) return 'unavailable';
-  return r.listening ? `listening ${r.listening} MHz` : r.job ? (r.job === 'pager' ? 'decoding pagers' : 'reading sensors') : S.air.enabled ? 'tracking aircraft' : r.enabled ? 'surveying' : 'idle';
+  return r.listening ? `listening ${r.listening} MHz` : r.job ? 'reading sensors' : S.air.enabled ? 'tracking aircraft' : r.enabled ? 'surveying' : 'idle';
 }
 
 // ---- aircraft --------------------------------------------------------------------------------------
@@ -701,6 +704,7 @@ function renderAir() {
   const btn = $('#btn-air');
   btn.disabled = !S.connected || (!A.enabled && !sdrCapability('aircraft').available);
   btn.textContent = A.enabled ? 'Stop tracking' : 'Start tracking';
+  btn.title = A.enabled ? '' : sdrTakeoverHint('aircraft');
   const err = $('#air-error');
   err.classList.toggle('hidden', !(r && r.error));
   err.textContent = (r && r.error) || '';
@@ -737,55 +741,15 @@ function setView(v) {
   try { localStorage.setItem('mesh.view', v); } catch { /* ignore */ }
   if (v === 'command') scheduleCommand();
   else if (map) setTimeout(() => map.invalidateSize(), 60);
+  radarLockSoon();
 }
 function stat(cls, big, small) {
   return el('div', { class: `stat ${cls}` }, el('i', { class: 'pulse' }), el('div', {}, el('b', { text: big }), el('span', { text: ` ${small}` })));
 }
+const CMDCARD = {};
 function ccard(title, body, { wide = false, action = null, id = null } = {}) {
   return el('section', { class: 'ccard' + (wide ? ' wide' : ''), id },
     el('h3', {}, el('span', { text: title }), action), body);
-}
-function niceScale(maxNm) { return [25, 50, 100, 150, 250].find(v => v >= maxNm) || 250; }
-function radarSvg(air) {
-  const size = 250, c = size / 2, R = 108;
-  const svg = document.createElementNS(SVGNS, 'svg');
-  svg.setAttribute('viewBox', `0 0 ${size} ${size}`);
-  svg.setAttribute('class', 'radar');
-  svg.setAttribute('role', 'img');
-  svg.setAttribute('aria-label', 'Aircraft radar');
-  const add = (tag, attrs, parent = svg) => {
-    const e = document.createElementNS(SVGNS, tag);
-    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
-    parent.append(e);
-    return e;
-  };
-  const pos = air.aircraft.filter(a => a.dist_nm != null);
-  const scale = niceScale(Math.max(20, ...pos.map(a => a.dist_nm)));
-  for (const f of [1 / 3, 2 / 3, 1]) add('circle', { cx: c, cy: c, r: R * f, class: 'ring' });
-  add('line', { x1: c, y1: c - R, x2: c, y2: c + R, class: 'axis' });
-  add('line', { x1: c - R, y1: c, x2: c + R, y2: c, class: 'axis' });
-  const t = add('text', { x: c, y: c - R - 3, 'text-anchor': 'middle' }); t.textContent = 'N';
-  const t2 = add('text', { x: c + R - 2, y: c + 10, 'text-anchor': 'end' }); t2.textContent = `${scale} NM`;
-  const g = add('g', { class: 'sweep' });
-  const defs = add('defs', {}, g);
-  const grad = add('linearGradient', { id: 'sw', x1: '0', y1: '0', x2: '1', y2: '0' }, defs);
-  add('stop', { offset: '0', 'stop-color': '#3fd17d', 'stop-opacity': '0.0' }, grad);
-  add('stop', { offset: '1', 'stop-color': '#3fd17d', 'stop-opacity': '0.55' }, grad);
-  add('path', { d: `M ${c} ${c} L ${c} ${c - R} A ${R} ${R} 0 0 0 ${c - R * Math.sin(0.7)} ${c - R * Math.cos(0.7)} Z`, fill: 'url(#sw)', transform: `rotate(0 ${c} ${c})` }, g);
-  add('line', { x1: c, y1: c, x2: c, y2: c - R, stroke: '#3fd17d', 'stroke-width': '1.5' }, g);
-  add('circle', { cx: c, cy: c, r: 3, fill: '#e6edf3' });
-  for (const a of pos.slice(0, 25)) {
-    const r = Math.min(a.dist_nm / scale, 1) * R, th = (a.bearing * Math.PI) / 180;
-    const x = c + r * Math.sin(th), y = c - r * Math.cos(th);
-    const d = add('circle', { cx: x, cy: y, r: 3.4, class: 'dotp', fill: altColor(a.alt_ft) });
-    d.style.fill = altColor(a.alt_ft);
-    if (a.track != null) {
-      const h = (a.track * Math.PI) / 180;
-      add('line', { x1: x, y1: y, x2: x + 9 * Math.sin(h), y2: y - 9 * Math.cos(h), stroke: altColor(a.alt_ft), 'stroke-width': '1.4' });
-    }
-    if (pos.length <= 12) { const l = add('text', { x: x + 6, y: y - 5, class: 'lbl' }); l.textContent = acName(a); }
-  }
-  return svg;
 }
 function renderCommand() {
   const box = $('#command');
@@ -846,16 +810,14 @@ function renderCommand() {
   }
   if (!liveNodes.length) mesh.append(el('div', { class: 'empty-state', text: 'No other nodes heard in the last two hours.' }));
 
-  // airspace
-  const air = el('div', { class: 'radar-wrap' }, radarSvg(A));
-  const at = el('div', { style: 'flex:1;min-width:170px' });
+  // airspace: the shared satellite radar map (built once, never re-inserted) plus a list refreshed each tick
+  const at = el('div', { class: 'cmd-air-list' });
   for (const a of A.aircraft.filter(x => x.dist_nm != null).slice(0, 6)) {
     at.append(el('div', { class: 'crow', onclick: () => selectAircraft(a.icao) },
       el('b', { style: `color:${altColor(a.alt_ft)}`, text: acName(a) }), el('span', { class: 'x', text: `${fmtAlt(a.alt_ft)}${a.gs_kt != null ? ` · ${a.gs_kt} kt` : ''}` }),
       el('span', { class: 't', text: `${a.dist_nm} NM ${a.bearing}°` })));
   }
-  if (!A.aircraft.length) at.append(el('div', { class: 'empty-state', text: A.enabled ? 'Listening on 1090 MHz…' : 'Aircraft tracking is off. Start it to see planes overhead on the radar and the map.' }));
-  air.append(at);
+  if (!A.aircraft.length) at.append(el('div', { class: 'empty-state', text: A.enabled ? 'Listening on 1090 MHz…' : 'Aircraft tracking is off. Start it to see planes overhead on the radar map.' }));
 
   // radio
   const radio = el('div', {});
@@ -870,6 +832,23 @@ function renderCommand() {
     }
     if (!r.channels.length) radio.append(el('div', { class: 'empty-state', text: 'No survey results yet. Start a survey to find active channels.' }));
   }
+
+  // sensors: environment sensors heard by the current / last sensor scan
+  const sj = S.job?.kind === 'sensors' ? S.job : null, sensing = !!sj?.enabled;
+  const sdevs = sj?.devices || [];
+  const tempF = v => { const t = v.readings.temperature_C ?? v.readings.temperature_1_C; return t ? t.value * 9 / 5 + 32 : null; };
+  const temps = sdevs.map(tempF).filter(t => t != null);
+  const sens = el('div', {}, el('div', { class: 'kpis' },
+    el('div', {}, el('div', { class: 'big', text: String(sdevs.length) }), el('span', { text: sdevs.length === 1 ? 'sensor heard' : 'sensors heard' })),
+    el('div', {}, el('div', { class: 'big', style: 'font-size:24px', text: temps.length ? (Math.round(Math.min(...temps)) === Math.round(Math.max(...temps)) ? `${Math.round(temps[0])}°F` : `${Math.round(Math.min(...temps))}–${Math.round(Math.max(...temps))}°F`) : '–' }), el('span', { text: 'outdoor temps' }))));
+  for (const v of sdevs.slice(0, 4)) {
+    const f = tempF(v);
+    sens.append(el('div', { class: 'crow', onclick: () => setPage('sensors') }, el('b', { text: v.model }),
+      el('span', { class: 'x', text: f != null ? `${Math.round(f)}°F${v.readings.humidity ? ` · ${v.readings.humidity.value}%` : ''}` : `${v.count} reports` }),
+      el('span', { class: 't', text: `${ago(v.last_seen)} ago` })));
+  }
+  if (!sdevs.length) sens.append(el('div', { class: 'empty-state', text: !sdrCapability('sensors').available ? sdrCapability('sensors').error : sensing ? `Scanning ${fmtJobMhz(sj.mhz)}… sensors report every 30–90 seconds.` : 'Sensor scan is off. Start it to find weather stations and thermometers near you.' }));
+  if (sj?.ignored) sens.append(el('div', { class: 'dim', style: 'font-size:12px', text: `${sj.ignored} other transmissions ignored (cars, remotes, alarms: counted, never listed).` }));
 
   // weather
   const wx = el('div', {});
@@ -890,16 +869,40 @@ function renderCommand() {
   if (!S.events.length) feed.append(el('div', { class: 'empty-state', text: 'Live events appear here as they happen: messages, nodes, aircraft, the SDR and news updates.' }));
 
   const openTab = t => () => setPage(t);
-  const grid = el('div', { class: 'cmd-grid' },
+  // The two map cards are built once and never re-inserted: moving them would restart the radar animations
+  // and interrupt a drag. Every other card is swapped in place each tick.
+  CMDCARD.meshmap ||= ccard('Mesh radar', cmdMapHost('mesh'), { id: 'card-meshmap', action: el('button', { onclick: openTab('nodes'), text: 'open map' }) });
+  if (!CMDCARD.air) {
+    const btn = el('button', { id: 'cmd-air-btn', onclick: () => radioSend(S.air.enabled ? 'aircraft_stop' : 'aircraft_start') });
+    const body = el('div', { class: 'cmd-air-body' });
+    CMDCARD.air = ccard('Airspace', el('div', {}, cmdMapHost('air'), body), { id: 'card-air',
+      action: el('span', { class: 'row-flex' }, el('button', { onclick: openTab('air'), text: 'open map' }), btn) });
+    CMDCARD.air.btn = btn; CMDCARD.air.body = body;
+  }
+  const airBtn = CMDCARD.air.btn;
+  airBtn.textContent = A.enabled ? 'stop tracking' : 'start tracking';
+  airBtn.disabled = !S.connected || (!A.enabled && !sdrCapability('aircraft').available);
+  if (A.enabled) airBtn.removeAttribute('title'); else { const hint = sdrTakeoverHint('aircraft'); if (hint) airBtn.title = hint; else airBtn.removeAttribute('title'); }
+  CMDCARD.air.body.replaceChildren(at);
+  const cards = [
     ccard('Live news watch', news, { wide: true, id: 'card-news' }),
     ccard('Messages', msgs, { id: 'card-msgs', action: el('button', { onclick: openTab('chats'), text: 'open chats' }) }),
     ccard('Mesh', mesh, { id: 'card-mesh', action: el('button', { onclick: openTab('nodes'), text: 'all nodes' }) }),
-    ccard('Airspace', air, { id: 'card-air', action: el('button', { id: 'cmd-air-btn', onclick: () => radioSend(A.enabled ? 'aircraft_stop' : 'aircraft_start'), disabled: !S.connected || (!A.enabled && !sdrCapability('aircraft').available), text: A.enabled ? 'stop tracking' : 'start tracking' }) }),
-    ccard('Radio (SDR)', radio, { id: 'card-radio', action: el('button', { id: 'cmd-radio-btn', onclick: () => radioSend(r && r.enabled ? 'stop' : 'start'), disabled: !S.connected || (!r?.enabled && !sdrCapability('survey').available), text: r && r.enabled ? 'stop survey' : 'start survey' }) }),
+    CMDCARD.meshmap,
+    CMDCARD.air,
+    ccard('Radio (SDR)', radio, { id: 'card-radio', action: el('button', { id: 'cmd-radio-btn', title: r?.enabled ? null : sdrTakeoverHint('survey') || null, onclick: () => radioSend(r && r.enabled ? 'stop' : 'start'), disabled: !S.connected || (!r?.enabled && !sdrCapability('survey').available), text: r && r.enabled ? 'stop survey' : 'start survey' }) }),
+    ccard('Sensors', sens, { id: 'card-sensors', action: el('button', { id: 'cmd-sensors-btn', title: sensing ? null : sdrTakeoverHint('sensors') || null,
+      onclick: () => { if (sensing) radioSend('job_stop'); else if (ws?.readyState === 1) ws.send(JSON.stringify({ type: 'radio', cmd: 'job_start', kind: 'sensors', mhz: AUTO_MHZ })); },
+      disabled: !S.connected || (!sensing && !sdrCapability('sensors').available), text: sensing ? 'stop scan' : 'start scan' }) }),
     ccard('Weather', wx, { id: 'card-wx', action: el('button', { onclick: () => setPage('weather'), text: 'forecast & radar' }) }),
-    ccard('Live activity', feed, { id: 'card-feed' }));
-  box.replaceChildren(strip, grid);
+    ccard('Live activity', feed, { id: 'card-feed' })];
+  const grid = box.querySelector(':scope > .cmd-grid');
+  if (grid && grid.children.length === cards.length && cards.every((c, i) => grid.children[i].id === c.id)) {
+    box.querySelector(':scope > .cmd-strip').replaceWith(strip);
+    cards.forEach((c, i) => { if (grid.children[i] !== c) grid.children[i].replaceWith(c); });
+  } else box.replaceChildren(strip, el('div', { class: 'cmd-grid' }, ...cards));
   box.scrollTop = keep;
+  syncCmdMaps();
 }
 
 function init() {
