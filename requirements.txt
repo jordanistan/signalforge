@@ -1,4 +1,4 @@
 # Core web, serial-radio, and terminal interfaces. Versions verified in this workspace.
-aiohttp==3.14.3
+aiohttp==3.14.4
 meshtastic==2.7.11
 textual==8.2.8
